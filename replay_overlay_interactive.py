@@ -956,7 +956,7 @@ class NotificationWindow(QMainWindow):
         self.show()
 
 
-class RecIndicatorWindow(QMainWindow):
+class RecIndicatorWindow(QWidget):
     """Persistent REC indicator overlay - shows when replay buffer is active."""
 
     def __init__(self, config):
@@ -966,23 +966,12 @@ class RecIndicatorWindow(QMainWindow):
         self.setAttribute(Qt.WA_TranslucentBackground)
         self.setFixedSize(58, 22)
 
-        # Use QFrame for cleaner border-radius rendering
-        panel = QFrame()
-        panel.setStyleSheet("""
-            QFrame {
-                background-color: rgba(15, 15, 15, 220);
-                border-radius: 11px;
-                border: 1px solid rgba(233, 69, 96, 0.4);
-            }
-        """)
-        self.setCentralWidget(panel)
-
-        layout = QHBoxLayout(panel)
+        layout = QHBoxLayout(self)
         layout.setContentsMargins(8, 2, 8, 2)
         layout.setSpacing(4)
 
         # Red dot - use unicode circle for reliable rendering
-        self.dot = QLabel("\u2022")  # Bullet point renders as clean circle
+        self.dot = QLabel("\u2022")
         self.dot.setStyleSheet("color: #e94560; font-size: 14px; background: transparent;")
         self.dot.setAlignment(Qt.AlignCenter)
         layout.addWidget(self.dot)
@@ -1027,6 +1016,13 @@ class RecIndicatorWindow(QMainWindow):
             self.dot.setStyleSheet("color: #e94560; font-size: 14px; background: transparent;")
         else:
             self.dot.setStyleSheet("color: transparent; font-size: 14px; background: transparent;")
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing)
+        painter.setBrush(QColor(15, 15, 15, 220))
+        painter.setPen(QColor(233, 69, 96, 100))
+        painter.drawRoundedRect(self.rect().adjusted(0, 0, -1, -1), 11, 11)
 
     def set_active(self, active):
         if not self.config.get('show_rec_indicator', True):
