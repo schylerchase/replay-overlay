@@ -959,7 +959,17 @@ class NotificationWindow(QMainWindow):
         self.show()
 
 
-class RecIndicatorWindow(QWidget):
+class RecIndicatorPanel(QWidget):
+    """Custom painted panel for REC indicator."""
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing)
+        painter.setBrush(QColor(15, 15, 15, 220))
+        painter.setPen(QColor(233, 69, 96, 100))
+        painter.drawRoundedRect(self.rect().adjusted(0, 0, -1, -1), 11, 11)
+
+
+class RecIndicatorWindow(QMainWindow):
     """Persistent REC indicator overlay - shows when replay buffer is active."""
 
     def __init__(self, config):
@@ -969,7 +979,10 @@ class RecIndicatorWindow(QWidget):
         self.setAttribute(Qt.WA_TranslucentBackground)
         self.setFixedSize(58, 22)
 
-        layout = QHBoxLayout(self)
+        panel = RecIndicatorPanel()
+        self.setCentralWidget(panel)
+
+        layout = QHBoxLayout(panel)
         layout.setContentsMargins(8, 2, 8, 2)
         layout.setSpacing(4)
 
@@ -1017,15 +1030,9 @@ class RecIndicatorWindow(QWidget):
         self._blink_state = not self._blink_state
         if self._blink_state:
             self.dot.setStyleSheet("color: #e94560; font-size: 14px; background: transparent;")
+            self.raise_()  # Keep on top during blink cycle
         else:
             self.dot.setStyleSheet("color: transparent; font-size: 14px; background: transparent;")
-
-    def paintEvent(self, event):
-        painter = QPainter(self)
-        painter.setRenderHint(QPainter.Antialiasing)
-        painter.setBrush(QColor(15, 15, 15, 220))
-        painter.setPen(QColor(233, 69, 96, 100))
-        painter.drawRoundedRect(self.rect().adjusted(0, 0, -1, -1), 11, 11)
 
     def set_active(self, active):
         if not self.config.get('show_rec_indicator', True):
@@ -1036,6 +1043,7 @@ class RecIndicatorWindow(QWidget):
             self._position()  # Reposition each time in case config changed
             self._blink_timer.start(500)
             self.show()
+            self.raise_()  # Force to top of window stack
         else:
             self._blink_timer.stop()
             self.hide()
@@ -1053,6 +1061,7 @@ class OverlayPanel(QMainWindow):
         self._source_widgets = {}
         self._audio_widgets = {}
         self._last_audio_names = set()
+        self._last_game = None  # Track last game for organize-by-game
 
         self._setup_ui()
         self._connect_signals()
@@ -1436,6 +1445,9 @@ class OverlayPanel(QMainWindow):
     def _save_replay(self):
         if self.config.get('organize_by_game', False):
             game = get_foreground_process()
+            # If foreground is overlay or ignored, use last tracked game
+            if not game or game.lower() in IGNORED_PROCESSES:
+                game = getattr(self, '_last_game', None)
             if game and game.lower() not in IGNORED_PROCESSES:
                 if self.app.replay_handler:
                     self.app.replay_handler.pending_game = game
@@ -1477,6 +1489,10 @@ class OverlayPanel(QMainWindow):
             self.show_overlay()
 
     def show_overlay(self):
+        # Capture the current game BEFORE showing overlay
+        game = get_foreground_process()
+        if game and game.lower() not in IGNORED_PROCESSES:
+            self._last_game = game
         self._visible = True
         self._position_window()
         self.show()
