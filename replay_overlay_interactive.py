@@ -44,7 +44,10 @@ except ImportError:
 
 VIDEO_EXTENSIONS = {'.mp4', '.mkv', '.flv', '.avi', '.mov', '.ts', '.m4v'}
 
-CONFIG_PATH = Path(__file__).parent / "config.json"
+# Store config in LocalAppData
+APP_DATA_DIR = Path(os.environ.get('LOCALAPPDATA', Path.home())) / "ReplayOverlay"
+APP_DATA_DIR.mkdir(parents=True, exist_ok=True)
+CONFIG_PATH = APP_DATA_DIR / "config.json"
 DEFAULT_CONFIG = {
     "obs_port": 4455,
     "obs_password": "",
@@ -1680,10 +1683,10 @@ class App:
             print("Keyboard library not available")
             return
 
-        # Remove existing hooks
-        for hook in self._hotkey_hooks:
+        # Remove existing hotkeys by key string
+        for key in self._hotkey_hooks:
             try:
-                keyboard.unhook(hook)
+                keyboard.remove_hotkey(key)
             except: pass
         self._hotkey_hooks.clear()
 
@@ -1697,27 +1700,28 @@ class App:
 
             # Validate hotkeys - must be at least 2 chars and not just modifiers
             if len(toggle_key) >= 2 and toggle_key not in ('+', 'ctrl', 'alt', 'shift'):
-                hook1 = keyboard.add_hotkey(toggle_key, self._on_toggle_hotkey, suppress=False)
-                self._hotkey_hooks.append(hook1)
+                keyboard.add_hotkey(toggle_key, self._on_toggle_hotkey, suppress=False)
+                self._hotkey_hooks.append(toggle_key)
                 print(f"Toggle hotkey registered: {toggle_key.upper()}")
             else:
                 print(f"Invalid toggle hotkey: '{toggle_key}', using F10")
-                hook1 = keyboard.add_hotkey('f10', self._on_toggle_hotkey, suppress=False)
-                self._hotkey_hooks.append(hook1)
+                keyboard.add_hotkey('f10', self._on_toggle_hotkey, suppress=False)
+                self._hotkey_hooks.append('f10')
 
             if len(save_key) >= 2 and save_key not in ('+', 'ctrl', 'alt', 'shift'):
-                hook2 = keyboard.add_hotkey(save_key, self._on_save_hotkey, suppress=False)
-                self._hotkey_hooks.append(hook2)
+                keyboard.add_hotkey(save_key, self._on_save_hotkey, suppress=False)
+                self._hotkey_hooks.append(save_key)
                 print(f"Save hotkey registered: {save_key.upper()}")
             else:
                 print(f"Invalid save hotkey: '{save_key}', using F9")
-                hook2 = keyboard.add_hotkey('f9', self._on_save_hotkey, suppress=False)
-                self._hotkey_hooks.append(hook2)
+                keyboard.add_hotkey('f9', self._on_save_hotkey, suppress=False)
+                self._hotkey_hooks.append('f9')
         except Exception as e:
             print(f"Hotkey error: {e}")
 
     def _on_toggle_hotkey(self):
         """Handle toggle hotkey press - emits signal for thread safety."""
+        print("F10 pressed - toggling overlay")
         self.signals.toggle_overlay.emit()
 
     def _on_save_hotkey(self):
