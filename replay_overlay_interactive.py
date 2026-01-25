@@ -18,7 +18,7 @@ from PySide6.QtWidgets import (
     QLabel, QPushButton, QFrame, QSystemTrayIcon, QMenu,
     QListWidget, QSlider, QCheckBox, QScrollArea, QLineEdit,
     QFileDialog, QSpinBox, QDoubleSpinBox, QDialog, QTabWidget, QFormLayout,
-    QGroupBox, QComboBox
+    QGroupBox, QComboBox, QWizard, QWizardPage
 )
 from PySide6.QtCore import Qt, QTimer, Signal, QObject, QSize
 from PySide6.QtGui import QPixmap, QIcon, QColor, QAction, QPainter, QFont
@@ -655,6 +655,178 @@ class AudioWidget(QWidget):
         self.slider.blockSignals(True)
         self.slider.setValue(int(volume * 100))
         self.slider.blockSignals(False)
+
+
+class SetupWizard(QWizard):
+    """First-run setup wizard for easy configuration."""
+
+    def __init__(self, config, parent=None):
+        super().__init__(parent)
+        self.config = config
+        self.setWindowTitle("Replay Overlay Setup")
+        self.setWizardStyle(QWizard.ModernStyle)
+        self.setFixedSize(500, 400)
+
+        self.addPage(self._create_welcome_page())
+        self.addPage(self._create_obs_page())
+        self.addPage(self._create_hotkey_page())
+        self.addPage(self._create_folder_page())
+        self.addPage(self._create_finish_page())
+
+    def _create_welcome_page(self):
+        page = QWizardPage()
+        page.setTitle("Welcome to Replay Overlay")
+        page.setSubTitle("This wizard will help you set up your replay buffer overlay.")
+
+        layout = QVBoxLayout(page)
+        layout.addWidget(QLabel(
+            "Replay Overlay gives you ShadowPlay-style controls for OBS:\n\n"
+            "- Quick access to scenes, sources, and audio\n"
+            "- Save replay buffer with a hotkey\n"
+            "- Automatic organization by game\n"
+            "- On-screen REC indicator\n\n"
+            "Click Next to begin setup."
+        ))
+        layout.addStretch()
+        return page
+
+    def _create_obs_page(self):
+        page = QWizardPage()
+        page.setTitle("OBS Connection")
+        page.setSubTitle("Configure how the overlay connects to OBS Studio.")
+
+        layout = QFormLayout(page)
+
+        self.port_spin = QSpinBox()
+        self.port_spin.setRange(1, 65535)
+        self.port_spin.setValue(self.config.get('obs_port', 4455))
+        layout.addRow("WebSocket Port:", self.port_spin)
+
+        self.password_edit = QLineEdit()
+        self.password_edit.setEchoMode(QLineEdit.Password)
+        self.password_edit.setText(self.config.get('obs_password', ''))
+        self.password_edit.setPlaceholderText("Leave empty if no password set")
+        layout.addRow("Password:", self.password_edit)
+
+        hint = QLabel("In OBS: Tools > WebSocket Server Settings")
+        hint.setStyleSheet("color: gray; font-size: 10px;")
+        layout.addRow("", hint)
+
+        self.auto_launch_cb = QCheckBox("Auto-launch OBS when overlay starts")
+        self.auto_launch_cb.setChecked(self.config.get('auto_launch_obs', False))
+        layout.addRow("", self.auto_launch_cb)
+
+        self.auto_buffer_cb = QCheckBox("Auto-start replay buffer on connect")
+        self.auto_buffer_cb.setChecked(self.config.get('auto_start_buffer', False))
+        layout.addRow("", self.auto_buffer_cb)
+
+        return page
+
+    def _create_hotkey_page(self):
+        page = QWizardPage()
+        page.setTitle("Hotkeys")
+        page.setSubTitle("Set up global hotkeys for quick access.")
+
+        layout = QFormLayout(page)
+
+        self.toggle_edit = QLineEdit()
+        self.toggle_edit.setText(self.config.get('toggle_hotkey', 'f10'))
+        self.toggle_edit.setPlaceholderText("e.g., f10, ctrl+shift+o")
+        layout.addRow("Toggle Overlay:", self.toggle_edit)
+
+        self.save_edit = QLineEdit()
+        self.save_edit.setText(self.config.get('save_hotkey', 'f9'))
+        self.save_edit.setPlaceholderText("e.g., f9, num add")
+        layout.addRow("Save Replay:", self.save_edit)
+
+        sync_btn = QPushButton("Sync from OBS")
+        sync_btn.clicked.connect(self._sync_from_obs)
+        layout.addRow("", sync_btn)
+
+        hint = QLabel("Tip: Use the same save hotkey as OBS for consistency")
+        hint.setStyleSheet("color: gray; font-size: 10px;")
+        layout.addRow("", hint)
+
+        return page
+
+    def _sync_from_obs(self):
+        hotkey = get_obs_replay_hotkey()
+        if hotkey:
+            self.save_edit.setText(hotkey)
+
+    def _create_folder_page(self):
+        page = QWizardPage()
+        page.setTitle("Recording Folder")
+        page.setSubTitle("Choose where your replays are saved.")
+
+        layout = QVBoxLayout(page)
+
+        folder_row = QHBoxLayout()
+        self.folder_edit = QLineEdit()
+        self.folder_edit.setText(self.config.get('watch_folder', str(Path.home() / "Videos")))
+        folder_row.addWidget(self.folder_edit)
+        browse_btn = QPushButton("Browse...")
+        browse_btn.clicked.connect(self._browse_folder)
+        folder_row.addWidget(browse_btn)
+        layout.addLayout(folder_row)
+
+        self.organize_cb = QCheckBox("Organize replays by game (creates subfolders)")
+        self.organize_cb.setChecked(self.config.get('organize_by_game', True))
+        layout.addWidget(self.organize_cb)
+
+        self.sync_folder_cb = QCheckBox("Sync folder from OBS settings")
+        self.sync_folder_cb.setChecked(self.config.get('sync_obs_folder', True))
+        layout.addWidget(self.sync_folder_cb)
+
+        layout.addStretch()
+        return page
+
+    def _browse_folder(self):
+        folder = QFileDialog.getExistingDirectory(self, "Select Folder", self.folder_edit.text())
+        if folder:
+            self.folder_edit.setText(folder)
+
+    def _create_finish_page(self):
+        page = QWizardPage()
+        page.setTitle("Setup Complete")
+        page.setSubTitle("You're all set!")
+
+        layout = QVBoxLayout(page)
+        layout.addWidget(QLabel(
+            "Configuration complete!\n\n"
+            "Quick tips:\n"
+            "- Press your toggle hotkey to show/hide the overlay\n"
+            "- The REC indicator shows when replay buffer is active\n"
+            "- Right-click the tray icon for more options\n"
+            "- Access settings anytime from the overlay or tray\n\n"
+            "Click Finish to start using Replay Overlay."
+        ))
+
+        self.startup_cb = QCheckBox("Start with Windows")
+        self.startup_cb.setChecked(self.config.get('start_with_windows', False))
+        layout.addWidget(self.startup_cb)
+
+        layout.addStretch()
+        return page
+
+    def accept(self):
+        # Save all settings
+        self.config['obs_port'] = self.port_spin.value()
+        self.config['obs_password'] = self.password_edit.text()
+        self.config['auto_launch_obs'] = self.auto_launch_cb.isChecked()
+        self.config['auto_start_buffer'] = self.auto_buffer_cb.isChecked()
+        self.config['toggle_hotkey'] = self.toggle_edit.text() or 'f10'
+        self.config['save_hotkey'] = self.save_edit.text() or 'f9'
+        self.config['watch_folder'] = self.folder_edit.text()
+        self.config['organize_by_game'] = self.organize_cb.isChecked()
+        self.config['sync_obs_folder'] = self.sync_folder_cb.isChecked()
+        self.config['start_with_windows'] = self.startup_cb.isChecked()
+
+        if self.startup_cb.isChecked():
+            set_windows_startup(True)
+
+        save_config(self.config)
+        super().accept()
 
 
 class SettingsDialog(QDialog):
@@ -1583,10 +1755,18 @@ class OverlayPanel(QMainWindow):
 class App:
     def __init__(self):
         self.config = load_config()
-        self._sync_obs_hotkey()  # Try to read hotkey from OBS config
         self.app = QApplication(sys.argv)
         self.app.setQuitOnLastWindowClosed(False)
 
+        # Show setup wizard on first run (no config file exists)
+        if not CONFIG_PATH.exists():
+            wizard = SetupWizard(self.config)
+            if wizard.exec():
+                self.config = load_config()  # Reload after wizard saves
+            else:
+                sys.exit(0)  # User cancelled wizard
+
+        self._sync_obs_hotkey()  # Try to read hotkey from OBS config
         self.signals = SignalBridge()
         self.obs = OBSController(
             port=self.config.get('obs_port', 4455),
