@@ -1003,19 +1003,21 @@ class RecIndicatorWindow(QMainWindow):
         margin = 20
         w, h = self.width(), self.height()
 
-        # Calculate x position
-        if 'left' in pos:
-            x = margin
-        elif 'right' in pos:
-            x = screen.width() - w - margin
-        else:  # center
-            x = (screen.width() - w) // 2
-
-        # Calculate y position
-        if 'top' in pos:
-            y = margin
-        else:  # bottom
-            y = screen.height() - h - margin
+        match pos:
+            case 'top-left':
+                x, y = margin, margin
+            case 'top-center':
+                x, y = (screen.width() - w) // 2, margin
+            case 'top-right':
+                x, y = screen.width() - w - margin, margin
+            case 'bottom-left':
+                x, y = margin, screen.height() - h - margin
+            case 'bottom-center':
+                x, y = (screen.width() - w) // 2, screen.height() - h - margin
+            case 'bottom-right':
+                x, y = screen.width() - w - margin, screen.height() - h - margin
+            case _:
+                x, y = margin, margin
 
         self.move(x, y)
 
@@ -1500,16 +1502,17 @@ class OverlayPanel(QMainWindow):
         else:
             # Update cursor based on hover position
             edge = self._get_resize_edge(event.position().toPoint())
-            if edge in ('right', 'left'):
-                self.setCursor(Qt.SizeHorCursor)
-            elif edge in ('bottom', 'top'):
-                self.setCursor(Qt.SizeVerCursor)
-            elif edge in ('bottomright', 'topleft'):
-                self.setCursor(Qt.SizeFDiagCursor)
-            elif edge in ('bottomleft', 'topright'):
-                self.setCursor(Qt.SizeBDiagCursor)
-            else:
-                self.setCursor(Qt.ArrowCursor)
+            match edge:
+                case 'right' | 'left':
+                    self.setCursor(Qt.SizeHorCursor)
+                case 'bottom' | 'top':
+                    self.setCursor(Qt.SizeVerCursor)
+                case 'bottomright' | 'topleft':
+                    self.setCursor(Qt.SizeFDiagCursor)
+                case 'bottomleft' | 'topright':
+                    self.setCursor(Qt.SizeBDiagCursor)
+                case _:
+                    self.setCursor(Qt.ArrowCursor)
 
     def mouseReleaseEvent(self, event):
         self._resize_edge = None
