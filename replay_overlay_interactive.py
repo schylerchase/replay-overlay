@@ -1699,10 +1699,11 @@ class OverlayPanel(QMainWindow):
 
         # Only rebuild if the set of sources actually changed
         if current_names == self._last_audio_names:
-            # Just update mute states
+            # Update mute states and volume levels
             for src in audio:
                 if src['name'] in self._audio_widgets:
                     self._audio_widgets[src['name']].update_mute(src['muted'])
+                    self._audio_widgets[src['name']].update_volume(src['volume'])
             return
 
         # Sources changed - rebuild
