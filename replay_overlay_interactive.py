@@ -817,33 +817,50 @@ class SetupWizard(QWizard):
     def _create_obs_page(self):
         page = QWizardPage()
         page.setTitle("OBS Connection")
-        page.setSubTitle("Configure how the overlay connects to OBS Studio.")
+        page.setSubTitle("Enable WebSocket in OBS to connect the overlay.")
 
-        layout = QFormLayout(page)
+        layout = QVBoxLayout(page)
 
+        # Setup instructions
+        instructions = QLabel(
+            "<b>OBS WebSocket Setup:</b><br>"
+            "1. Open OBS Studio<br>"
+            "2. Go to <b>Tools > WebSocket Server Settings</b><br>"
+            "3. Check <b>Enable WebSocket Server</b><br>"
+            "4. Note the port (default: 4455)<br>"
+            "5. Optionally set a password<br><br>"
+            "<b>Replay Buffer Setup:</b><br>"
+            "1. Go to <b>Settings > Output > Replay Buffer</b><br>"
+            "2. Check <b>Enable Replay Buffer</b><br>"
+            "3. Set your desired buffer length"
+        )
+        instructions.setWordWrap(True)
+        instructions.setStyleSheet("background: #2a2a2a; padding: 10px; border-radius: 4px;")
+        layout.addWidget(instructions)
+
+        # Connection settings
+        form = QFormLayout()
         self.port_spin = QSpinBox()
         self.port_spin.setRange(1, 65535)
         self.port_spin.setValue(self.config.get('obs_port', 4455))
-        layout.addRow("WebSocket Port:", self.port_spin)
+        form.addRow("WebSocket Port:", self.port_spin)
 
         self.password_edit = QLineEdit()
         self.password_edit.setEchoMode(QLineEdit.Password)
         self.password_edit.setText(self.config.get('obs_password', ''))
         self.password_edit.setPlaceholderText("Leave empty if no password set")
-        layout.addRow("Password:", self.password_edit)
-
-        hint = QLabel("In OBS: Tools > WebSocket Server Settings")
-        hint.setStyleSheet("color: gray; font-size: 10px;")
-        layout.addRow("", hint)
+        form.addRow("Password:", self.password_edit)
+        layout.addLayout(form)
 
         self.auto_launch_cb = QCheckBox("Auto-launch OBS when overlay starts")
         self.auto_launch_cb.setChecked(self.config.get('auto_launch_obs', False))
-        layout.addRow("", self.auto_launch_cb)
+        layout.addWidget(self.auto_launch_cb)
 
         self.auto_buffer_cb = QCheckBox("Auto-start replay buffer on connect")
         self.auto_buffer_cb.setChecked(self.config.get('auto_start_buffer', False))
-        layout.addRow("", self.auto_buffer_cb)
+        layout.addWidget(self.auto_buffer_cb)
 
+        layout.addStretch()
         return page
 
     def _create_hotkey_page(self):
@@ -1565,10 +1582,11 @@ class OverlayPanel(QMainWindow):
         main.addLayout(row2)
 
         # === FOOTER ===
-        footer = QLabel(f"{self.config.get('toggle_hotkey', 'F10').upper()} toggle | {self.config.get('save_hotkey', 'F9').upper()} save")
-        footer.setAlignment(Qt.AlignCenter)
-        footer.setStyleSheet("color: #555; font-size: 9px; margin-top: 4px;")
-        main.addWidget(footer)
+        self.footer_label = QLabel()
+        self._update_footer_hints()
+        self.footer_label.setAlignment(Qt.AlignCenter)
+        self.footer_label.setStyleSheet("color: #555; font-size: 9px; margin-top: 4px;")
+        main.addWidget(self.footer_label)
 
         # Set minimum size, allow resizing
         self.setMinimumSize(340, 456)
@@ -1782,12 +1800,20 @@ class OverlayPanel(QMainWindow):
             duration = int(self.config.get('notification_duration', 3.0) * 1000)
             self.signals.show_notification.emit(msg, "#00FF00")
 
+    def _update_footer_hints(self):
+        """Update the footer with current hotkey configuration."""
+        toggle = self.config.get('toggle_hotkey', 'F10').upper()
+        save = self.config.get('save_hotkey', 'Num +').upper()
+        self.footer_label.setText(f"{toggle} toggle | {save} save")
+
     def _open_settings(self):
         dialog = SettingsDialog(self.config, self)
         if dialog.exec():
             self.config.update(dialog.config)
             save_config(self.config)
             print(f"Settings saved. Config: toggle={self.config.get('toggle_hotkey')}, save={self.config.get('save_hotkey')}")
+            # Update footer hints with new hotkeys
+            self._update_footer_hints()
             # Notify app to update hotkeys and REC indicator
             if hasattr(self.app, '_register_hotkeys'):
                 self.app._register_hotkeys()
@@ -1968,23 +1994,34 @@ class App:
 
     def _create_tray_icon(self):
         """Create a REC-style tray icon with dot and text."""
-        px = QPixmap(32, 32)
-        px.fill(QColor(30, 30, 30))  # Dark background for visibility
+        from PySide6.QtGui import QFontMetrics
+        size = 32
+        px = QPixmap(size, size)
+        px.fill(QColor(30, 30, 30))
         painter = QPainter(px)
         painter.setRenderHint(QPainter.Antialiasing)
         # Draw rounded rect background
         painter.setBrush(QColor(30, 30, 30))
         painter.setPen(QColor(60, 60, 60))
-        painter.drawRoundedRect(0, 0, 31, 31, 6, 6)
-        # Draw red dot (larger, centered vertically)
-        painter.setBrush(QColor("#e94560"))
-        painter.setPen(Qt.NoPen)
-        painter.drawEllipse(3, 10, 12, 12)
-        # Draw REC text
-        painter.setPen(QColor("#e94560"))
+        painter.drawRoundedRect(1, 1, size-2, size-2, 5, 5)
+        # Calculate centered layout
+        dot_size = 8
         font = QFont("Arial", 7, QFont.Bold)
         painter.setFont(font)
-        painter.drawText(16, 10, 14, 12, Qt.AlignLeft | Qt.AlignVCenter, "REC")
+        fm = QFontMetrics(font)
+        text_width = fm.horizontalAdvance("REC")
+        gap = 2
+        total_width = dot_size + gap + text_width
+        start_x = (size - total_width) // 2
+        # Draw red dot - centered vertically
+        dot_y = (size - dot_size) // 2
+        painter.setBrush(QColor("#e94560"))
+        painter.setPen(Qt.NoPen)
+        painter.drawEllipse(start_x, dot_y, dot_size, dot_size)
+        # Draw REC text - centered
+        painter.setPen(QColor("#e94560"))
+        text_x = start_x + dot_size + gap
+        painter.drawText(text_x, 0, text_width, size, Qt.AlignLeft | Qt.AlignVCenter, "REC")
         painter.end()
         return QIcon(px)
 
