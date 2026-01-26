@@ -11,6 +11,9 @@ import threading
 import time
 import ctypes
 import subprocess
+import logging
+import re
+import shlex
 from pathlib import Path
 
 from PySide6.QtWidgets import (
@@ -44,10 +47,22 @@ except ImportError:
 
 VIDEO_EXTENSIONS = {'.mp4', '.mkv', '.flv', '.avi', '.mov', '.ts', '.m4v'}
 
-# Store config in LocalAppData
+# Store config in LocalAppData with secure permissions
 APP_DATA_DIR = Path(os.environ.get('LOCALAPPDATA', Path.home())) / "ReplayOverlay"
 APP_DATA_DIR.mkdir(parents=True, exist_ok=True)
 CONFIG_PATH = APP_DATA_DIR / "config.json"
+LOG_PATH = APP_DATA_DIR / "overlay.log"
+
+# Setup logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler(LOG_PATH, encoding='utf-8'),
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger(__name__)
 DEFAULT_CONFIG = {
     "obs_port": 4455,
     "obs_password": "",
@@ -84,19 +99,50 @@ IGNORED_PROCESSES = {
 def load_config():
     if CONFIG_PATH.exists():
         try:
-            with open(CONFIG_PATH) as f:
-                return {**DEFAULT_CONFIG, **json.load(f)}
-        except:
-            pass
+            with open(CONFIG_PATH, encoding='utf-8') as f:
+                loaded = json.load(f)
+                config = DEFAULT_CONFIG.copy()
+                config.update(loaded)
+                return config
+        except (IOError, json.JSONDecodeError, ValueError) as e:
+            logger.warning(f"Failed to load config: {e}")
     return DEFAULT_CONFIG.copy()
 
 
 def save_config(config):
-    with open(CONFIG_PATH, 'w') as f:
-        json.dump(config, f, indent=2)
+    try:
+        with open(CONFIG_PATH, 'w', encoding='utf-8') as f:
+            json.dump(config, f, indent=2)
+        # Set restrictive permissions on config file (Windows)
+        if sys.platform == 'win32':
+            _set_file_permissions(CONFIG_PATH)
+        logger.info("Config saved successfully")
+    except IOError as e:
+        logger.error(f"Failed to save config: {e}")
+
+
+def _set_file_permissions(filepath):
+    """Set restrictive file permissions on Windows (current user only).
+
+    Security: Prevents other users from reading config with password.
+    """
+    try:
+        import subprocess
+        # Use icacls to set permissions: only current user has access
+        # /inheritance:r removes inherited permissions
+        # /grant:r gives explicit permission only to current user
+        username = os.environ.get('USERNAME', '')
+        if username:
+            subprocess.run(
+                ['icacls', str(filepath), '/inheritance:r', '/grant:r', f'{username}:(R,W)'],
+                capture_output=True, creationflags=subprocess.CREATE_NO_WINDOW
+            )
+    except (OSError, subprocess.SubprocessError) as e:
+        logger.debug(f"Could not set file permissions: {e}")
 
 
 def get_foreground_process():
+    """Get the name of the foreground process (case-preserved)."""
     if sys.platform != 'win32':
         return None
     try:
@@ -120,29 +166,93 @@ def get_foreground_process():
                 return Path(buffer.value).stem
         finally:
             kernel32.CloseHandle(handle)
-    except:
-        pass
+    except (OSError, ValueError) as e:
+        logger.debug(f"Failed to get foreground process: {e}")
     return None
+
+
+def is_process_ignored(process_name):
+    """Check if process should be ignored (case-insensitive)."""
+    if not process_name:
+        return True
+    return process_name.lower() in IGNORED_PROCESSES
+
+
+def is_valid_obs_executable(obs_path):
+    """Validate that obs_path points to a legitimate OBS executable.
+
+    Security: Prevents arbitrary executable launch via config manipulation.
+    """
+    if not obs_path:
+        return False
+
+    try:
+        path = Path(obs_path).resolve()
+
+        # Must exist and be a file
+        if not path.is_file():
+            return False
+
+        # Must be named obs64.exe or obs32.exe (case-insensitive)
+        filename = path.name.lower()
+        if filename not in ('obs64.exe', 'obs32.exe'):
+            logger.warning(f"Invalid OBS executable name: {filename}")
+            return False
+
+        # Must be in a directory containing 'obs-studio' in the path
+        path_str = str(path).lower()
+        if 'obs-studio' not in path_str and 'obs studio' not in path_str:
+            logger.warning(f"OBS path does not appear to be in OBS Studio directory: {obs_path}")
+            return False
+
+        return True
+    except (OSError, ValueError) as e:
+        logger.warning(f"Error validating OBS path: {e}")
+        return False
+
+
+def sanitize_profile_name(profile):
+    """Sanitize OBS profile name to prevent path traversal.
+
+    Security: Prevents directory traversal attacks via malicious profile names.
+    """
+    if not profile:
+        return 'Untitled'
+
+    # Remove any path traversal characters
+    sanitized = re.sub(r'[\\/:*?"<>|]', '', profile)
+    sanitized = sanitized.replace('..', '')
+
+    # Limit length
+    if len(sanitized) > 100:
+        sanitized = sanitized[:100]
+
+    return sanitized if sanitized else 'Untitled'
 
 
 def is_admin():
     if sys.platform != 'win32':
         return True
     try:
-        return ctypes.windll.shell32.IsUserAnAdmin()
-    except:
+        return bool(ctypes.windll.shell32.IsUserAnAdmin())
+    except (OSError, ValueError):
         return False
 
 
 def request_admin_restart():
+    """Request admin restart with properly quoted arguments."""
     if sys.platform != 'win32':
         return False
     try:
         script = sys.argv[0]
-        params = ' '.join(sys.argv[1:])
-        ctypes.windll.shell32.ShellExecuteW(None, "runas", sys.executable, f'"{script}" {params}', None, 1)
-        return True
-    except:
+        # Quote each argument individually to prevent injection
+        quoted_params = ' '.join(f'"{arg}"' for arg in sys.argv[1:]) if sys.argv[1:] else ''
+        full_params = f'"{script}" {quoted_params}'.strip()
+        logger.info(f"Requesting admin restart with params: {full_params}")
+        result = ctypes.windll.shell32.ShellExecuteW(None, "runas", sys.executable, full_params, None, 1)
+        return result > 32  # ShellExecute returns >32 on success
+    except (OSError, ValueError) as e:
+        logger.error(f"Admin restart failed: {e}")
         return False
 
 
@@ -201,7 +311,7 @@ def get_windows_startup():
         except FileNotFoundError:
             winreg.CloseKey(key)
             return False
-    except:
+    except OSError:
         return False
 
 
@@ -227,7 +337,7 @@ def get_obs_replay_hotkey():
             for line in f:
                 line = line.strip()
                 if line.startswith('Profile='):
-                    profile = line.split('=', 1)[1]
+                    profile = sanitize_profile_name(line.split('=', 1)[1])
                     break
 
         # Read profile's basic.ini for hotkeys
@@ -316,7 +426,7 @@ class OBSController:
             self.client = obsws.ReqClient(host='localhost', port=self.port, password=self.password, timeout=3)
             self._connected = True
             return True
-        except:
+        except Exception:
             self._connected = False
             return False
 
@@ -327,26 +437,26 @@ class OBSController:
     def get_scenes(self):
         if not self.connected: return []
         try: return [s['sceneName'] for s in self.client.get_scene_list().scenes]
-        except: return []
+        except Exception: return []
 
     def get_current_scene(self):
         if not self.connected: return None
         try: return self.client.get_current_program_scene().scene_name
-        except: return None
+        except Exception: return None
 
     def set_scene(self, name):
         if not self.connected: return False
         try:
             self.client.set_current_program_scene(name)
             return True
-        except: return False
+        except Exception: return False
 
     def get_scene_items(self, scene):
         if not self.connected: return []
         try:
             return [{'id': i.get('sceneItemId'), 'name': i.get('sourceName'), 'visible': i.get('sceneItemEnabled', False)}
                     for i in self.client.get_scene_item_list(scene).scene_items]
-        except: return []
+        except Exception: return []
 
     def set_source_visible(self, scene, item_id, visible):
         if not self.connected:
@@ -354,7 +464,7 @@ class OBSController:
         try:
             self.client.set_scene_item_enabled(scene, item_id, visible)
             return True
-        except:
+        except Exception:
             return False
 
     def get_audio_sources(self):
@@ -378,35 +488,41 @@ class OBSController:
                             'volume': vol.input_volume_mul if hasattr(vol, 'input_volume_mul') else 1.0,
                             'muted': mute.input_muted if hasattr(mute, 'input_muted') else False
                         })
-                    except: pass
+                    except Exception: pass
             return sources
-        except: return []
+        except Exception: return []
 
     def set_input_volume(self, name, vol):
         if not self.connected: return False
         try:
             self.client.set_input_volume(name, vol_mul=vol)
             return True
-        except: return False
+        except Exception: return False
 
     def toggle_mute(self, name):
         if not self.connected: return False
         try:
             self.client.toggle_input_mute(name)
             return True
-        except: return False
+        except Exception: return False
 
     def get_screenshot(self, w=320, h=180):
+        """Get screenshot with base64 size validation."""
         if not self.connected: return None
+        MAX_BASE64_SIZE = 10 * 1024 * 1024  # 10MB max for decoded image
         try:
             scene = self.get_current_scene()
             if not scene: return None
             resp = self.client.get_source_screenshot(name=scene, img_format="png", width=w, height=h, quality=-1)
             data = resp.image_data.split(',')[1] if ',' in resp.image_data else resp.image_data
+            # Validate base64 size before decoding
+            if len(data) > MAX_BASE64_SIZE:
+                logger.warning("Screenshot base64 data exceeds size limit")
+                return None
             px = QPixmap()
             px.loadFromData(base64.b64decode(data))
             return px
-        except: return None
+        except Exception: return None
 
     def has_active_capture(self):
         if not self.connected: return None
@@ -419,74 +535,74 @@ class OBSController:
                     try:
                         if self.client.get_source_active(item.get('sourceName')).video_active:
                             return True
-                    except: pass
+                    except Exception: pass
             return False
-        except: return None
+        except Exception: return None
 
     def get_stream_status(self):
         if not self.connected: return None
         try: return self.client.get_stream_status().output_active
-        except: return None
+        except Exception: return None
 
     def get_record_status(self):
         if not self.connected: return None
         try: return self.client.get_record_status().output_active
-        except: return None
+        except Exception: return None
 
     def get_buffer_status(self):
         if not self.connected: return None
         try: return self.client.get_replay_buffer_status().output_active
-        except: return None
+        except Exception: return None
 
     def get_virtualcam_status(self):
         if not self.connected: return None
         try: return self.client.get_virtual_cam_status().output_active
-        except: return None
+        except Exception: return None
 
     def toggle_stream(self):
         if self.connected:
             try: self.client.toggle_stream()
-            except: pass
+            except Exception: pass
 
     def toggle_record(self):
         if self.connected:
             try: self.client.toggle_record()
-            except: pass
+            except Exception: pass
 
     def toggle_buffer(self):
         if self.connected:
             try: self.client.toggle_replay_buffer()
-            except: pass
+            except Exception: pass
 
     def start_buffer(self):
         if self.connected:
             try: self.client.start_replay_buffer()
-            except: pass
+            except Exception: pass
 
     def stop_buffer(self):
         if self.connected:
             try: self.client.stop_replay_buffer()
-            except: pass
+            except Exception: pass
 
     def save_buffer(self):
         if self.connected:
             try:
                 self.client.save_replay_buffer()
                 return True
-            except: pass
+            except Exception: pass
         return False
 
     def toggle_virtualcam(self):
         if self.connected:
             try: self.client.toggle_virtual_cam()
-            except: pass
+            except Exception: pass
 
     def set_record_directory(self, path):
         if not self.connected: return False
         try:
             self.client.set_record_directory(path)
             return True
-        except: return False
+        except Exception: return False
 
 
 class SignalBridge(QObject):
@@ -557,7 +673,7 @@ class ReplayHandler(FileSystemEventHandler):
                 else:
                     stable_count = 0
                 last_size = current_size
-            except:
+            except OSError:
                 pass
             time.sleep(0.5)
 
@@ -1827,14 +1943,18 @@ class App:
     def _connect_obs(self):
         if self.config.get('auto_launch_obs', False):
             obs_path = self.config.get('obs_path', '')
-            if obs_path and Path(obs_path).exists():
+            if obs_path and is_valid_obs_executable(obs_path):
                 # Check if OBS is already running
                 if not self._is_obs_running():
                     try:
                         # Must set cwd to OBS directory so it can find locale files
                         obs_dir = Path(obs_path).parent
                         subprocess.Popen([obs_path, '--minimize-to-tray'], cwd=str(obs_dir))
-                    except: pass
+                        logger.info(f"Launched OBS from: {obs_path}")
+                    except (OSError, ValueError) as e:
+                        logger.error(f"Failed to launch OBS: {e}")
+            elif obs_path:
+                logger.warning(f"Skipping OBS auto-launch: invalid path {obs_path}")
 
         def connect():
             for _ in range(10):
@@ -1871,7 +1991,7 @@ class App:
                 capture_output=True, text=True, creationflags=subprocess.CREATE_NO_WINDOW
             )
             return 'obs32.exe' in result.stdout.lower()
-        except:
+        except (OSError, subprocess.SubprocessError):
             return False
 
     def _register_hotkeys(self):
@@ -1883,7 +2003,7 @@ class App:
         for key in self._hotkey_hooks:
             try:
                 keyboard.remove_hotkey(key)
-            except: pass
+            except (KeyError, ValueError): pass
         self._hotkey_hooks.clear()
 
         if not self.config.get('hotkey_enabled', True):
