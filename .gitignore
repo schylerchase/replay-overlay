@@ -1,0 +1,39 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+env/
+.venv/
+ENV/
+
+# Build artifacts
+build/
+dist/
+*.spec
+*.exe
+installer_output/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Config with potential secrets
+config.json
+
+# OS files
+.DS_Store
+Thumbs.db
+nul
+
+# Logs
+*.log
+
+# Local development
+.env
+.env.local
+*.local
