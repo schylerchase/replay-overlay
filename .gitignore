@@ -11,6 +11,7 @@ config.json
 build/
 dist/
 *.spec
+installer_output/
 
 # IDE
 .vscode/
