@@ -1965,12 +1965,20 @@ class App:
                         folder = self.config.get('watch_folder', '')
                         if folder:
                             self.obs.set_record_directory(folder)
-                    # Auto-start replay buffer if configured
+                    # Auto-start replay buffer if configured (with retry for boot scenarios)
                     if self.config.get('auto_start_buffer', False):
-                        time.sleep(0.5)  # Brief delay to ensure OBS is ready
-                        if not self.obs.get_buffer_status():
-                            self.obs.start_buffer()
-                            print("Auto-started replay buffer")
+                        for attempt in range(5):
+                            time.sleep(0.5 + attempt * 1.0)  # 0.5s, 1.5s, 2.5s, 3.5s, 4.5s
+                            try:
+                                if not self.obs.get_buffer_status():
+                                    self.obs.start_buffer()
+                                    print("Auto-started replay buffer")
+                                break  # Success or already running, exit retry loop
+                            except Exception as e:
+                                if attempt < 4:
+                                    print(f"Buffer start attempt {attempt + 1} failed, retrying...")
+                                else:
+                                    print(f"Could not auto-start buffer after 5 attempts: {e}")
                     return
                 time.sleep(2)
             print("Could not connect to OBS")
