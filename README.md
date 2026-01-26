@@ -1,4 +1,6 @@
-# Replay Overlay
+# Replay Overlay (Development)
+
+> **Note:** This is the private development/testing repository. For the public release, see [replay-overlay](https://github.com/schylerchase/replay-overlay).
 
 A ShadowPlay-style overlay for OBS Studio that provides quick access to replay buffer controls, scene switching, and audio mixing.
 
