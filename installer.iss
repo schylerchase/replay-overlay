@@ -26,9 +26,9 @@ SolidCompression=yes
 WizardStyle=modern
 PrivilegesRequired=admin
 ArchitecturesInstallIn64BitMode=x64compatible
-; Close running instances before install
+; Close running instances before install (overlay and OBS)
 CloseApplications=force
-CloseApplicationsFilter=*.exe
+CloseApplicationsFilter=ReplayOverlay.exe,obs64.exe,obs32.exe
 
 [Languages]
 Name: "english"; MessagesFile: "compiler:Default.isl"
@@ -66,7 +66,13 @@ Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; ValueName: 
 
 [Code]
 function InitializeSetup(): Boolean;
+var
+  ResultCode: Integer;
 begin
+  // Force kill running processes before install
+  Exec('taskkill', '/F /IM ReplayOverlay.exe', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+  Exec('taskkill', '/F /IM obs64.exe', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+  Exec('taskkill', '/F /IM obs32.exe', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
   Result := True;
 end;
 

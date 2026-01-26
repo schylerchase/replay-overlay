@@ -723,6 +723,7 @@ class AudioWidget(QWidget):
         super().__init__()
         self.name = name
         self._muted = muted
+        self._last_user_change = 0  # Timestamp of last user interaction
         self.setFixedHeight(22)
 
         layout = QHBoxLayout(self)
@@ -749,8 +750,12 @@ class AudioWidget(QWidget):
         self.slider.setRange(0, 100)
         self.slider.setValue(int(volume * 100))
         self.slider.setFixedHeight(14)
-        self.slider.valueChanged.connect(lambda v: self.volume_changed.emit(self.name, v / 100.0))
+        self.slider.valueChanged.connect(self._on_slider_changed)
         layout.addWidget(self.slider, 1)
+
+    def _on_slider_changed(self, v):
+        self._last_user_change = time.time()
+        self.volume_changed.emit(self.name, v / 100.0)
 
     def _apply_mute_style(self, muted):
         if muted:
@@ -768,6 +773,9 @@ class AudioWidget(QWidget):
         self.mute_btn.blockSignals(False)
 
     def update_volume(self, volume):
+        # Skip poll updates for 1.5s after user interaction to prevent feedback loop
+        if time.time() - self._last_user_change < 1.5:
+            return
         self.slider.blockSignals(True)
         self.slider.setValue(int(volume * 100))
         self.slider.blockSignals(False)
@@ -1257,6 +1265,27 @@ class RecIndicatorPanel(QWidget):
         painter.drawRoundedRect(self.rect().adjusted(0, 0, -1, -1), 11, 11)
 
 
+class RecDot(QWidget):
+    """Custom painted red dot for REC indicator."""
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setFixedSize(10, 10)
+        self._visible = True
+
+    def set_visible(self, visible):
+        self._visible = visible
+        self.update()
+
+    def paintEvent(self, event):
+        if not self._visible:
+            return
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing)
+        painter.setBrush(QColor("#e94560"))
+        painter.setPen(Qt.NoPen)
+        painter.drawEllipse(0, 0, 10, 10)
+
+
 class RecIndicatorWindow(QMainWindow):
     """Persistent REC indicator overlay - shows when replay buffer is active."""
 
@@ -1271,19 +1300,19 @@ class RecIndicatorWindow(QMainWindow):
         self.setCentralWidget(panel)
 
         layout = QHBoxLayout(panel)
-        layout.setContentsMargins(8, 2, 8, 2)
-        layout.setSpacing(4)
+        layout.setContentsMargins(8, 0, 8, 0)
+        layout.setSpacing(5)
+        layout.setAlignment(Qt.AlignCenter)
 
-        # Red dot - use unicode circle for reliable rendering
-        self.dot = QLabel("\u2022")
-        self.dot.setStyleSheet("color: #e94560; font-size: 14px; background: transparent;")
-        self.dot.setAlignment(Qt.AlignCenter)
-        layout.addWidget(self.dot)
+        # Red dot - custom painted widget for perfect centering
+        self.dot = RecDot()
+        layout.addWidget(self.dot, 0, Qt.AlignVCenter)
 
         # REC text
         self.label = QLabel("REC")
-        self.label.setStyleSheet("color: #e94560; font-size: 9px; font-weight: bold; background: transparent; letter-spacing: 1px;")
-        layout.addWidget(self.label)
+        self.label.setStyleSheet("color: #e94560; font-size: 10px; font-weight: bold; background: transparent; letter-spacing: 1px;")
+        self.label.setAlignment(Qt.AlignVCenter)
+        layout.addWidget(self.label, 0, Qt.AlignVCenter)
 
         self._position()
         self._blink_timer = QTimer()
@@ -1316,11 +1345,9 @@ class RecIndicatorWindow(QMainWindow):
 
     def _blink(self):
         self._blink_state = not self._blink_state
+        self.dot.set_visible(self._blink_state)
         if self._blink_state:
-            self.dot.setStyleSheet("color: #e94560; font-size: 14px; background: transparent;")
             self.raise_()  # Keep on top during blink cycle
-        else:
-            self.dot.setStyleSheet("color: transparent; font-size: 14px; background: transparent;")
 
     def set_active(self, active):
         if not self.config.get('show_rec_indicator', True):
@@ -1919,9 +1946,7 @@ class App:
 
     def _setup_tray(self):
         self.tray = QSystemTrayIcon()
-        px = QPixmap(32, 32)
-        px.fill(QColor("#e94560"))
-        self.tray.setIcon(QIcon(px))
+        self.tray.setIcon(self._create_tray_icon())
         self.tray.setToolTip("Replay Overlay")
 
         menu = QMenu()
@@ -1940,6 +1965,28 @@ class App:
         self.tray.setContextMenu(menu)
         self.tray.activated.connect(lambda r: self.overlay.toggle_visibility() if r == QSystemTrayIcon.Trigger else None)
         self.tray.show()
+
+    def _create_tray_icon(self):
+        """Create a REC-style tray icon with dot and text."""
+        px = QPixmap(32, 32)
+        px.fill(QColor(30, 30, 30))  # Dark background for visibility
+        painter = QPainter(px)
+        painter.setRenderHint(QPainter.Antialiasing)
+        # Draw rounded rect background
+        painter.setBrush(QColor(30, 30, 30))
+        painter.setPen(QColor(60, 60, 60))
+        painter.drawRoundedRect(0, 0, 31, 31, 6, 6)
+        # Draw red dot (larger, centered vertically)
+        painter.setBrush(QColor("#e94560"))
+        painter.setPen(Qt.NoPen)
+        painter.drawEllipse(3, 10, 12, 12)
+        # Draw REC text
+        painter.setPen(QColor("#e94560"))
+        font = QFont("Arial", 7, QFont.Bold)
+        painter.setFont(font)
+        painter.drawText(16, 10, 14, 12, Qt.AlignLeft | Qt.AlignVCenter, "REC")
+        painter.end()
+        return QIcon(px)
 
     def _connect_obs(self):
         if self.config.get('auto_launch_obs', False):

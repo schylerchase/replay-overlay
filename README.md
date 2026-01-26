@@ -1,4 +1,4 @@
-# Replay Overlay Interactive
+# Replay Overlay
 
 A ShadowPlay-style overlay for OBS Studio that provides quick access to replay buffer controls, scene switching, and audio mixing.
 
@@ -22,8 +22,8 @@ A ShadowPlay-style overlay for OBS Studio that provides quick access to replay b
 
 ## Installation
 
-### From Executable
-Download `ReplayOverlay.exe` and run it.
+### From Installer
+Download and run `ReplayOverlay_Setup.exe` from the [Releases](https://github.com/schylerchase/replay-overlay-interactive/releases) page.
 
 ### From Source
 ```bash
@@ -35,12 +35,12 @@ python replay_overlay_interactive.py
 
 1. Enable OBS WebSocket server (Tools > WebSocket Server Settings)
 2. Launch the overlay
-3. Press `F10` (default) to toggle the overlay
+3. Press `F10` (default) to toggle the overlay visibility
 4. Press `Num +` (default) to save a replay
 
 ## Configuration
 
-Settings are stored in `config.json` in the same directory as the executable/script.
+Settings are stored in `%LOCALAPPDATA%\ReplayOverlay\config.json`.
 
 | Setting | Description | Default |
 |---------|-------------|---------|
@@ -49,12 +49,30 @@ Settings are stored in `config.json` in the same directory as the executable/scr
 | `watch_folder` | Folder to watch for new recordings | OBS output path |
 | `organize_by_game` | Sort replays into game folders | `true` |
 | `show_rec_indicator` | Show REC indicator when buffer active | `true` |
-| `rec_indicator_position` | Position: top-left, top-center, top-right, bottom-left, bottom-center, bottom-right | `top-left` |
-| `auto_launch_obs` | Start OBS if not running | `true` |
-| `auto_start_buffer` | Auto-start replay buffer on connect | `true` |
+| `rec_indicator_position` | Position: top-left, top-center, top-right, bottom-left, bottom-center, bottom-right | `top-right` |
+| `auto_launch_obs` | Start OBS if not running | `false` |
+| `auto_start_buffer` | Auto-start replay buffer on connect | `false` |
 | `obs_port` | OBS WebSocket port | `4455` |
 | `obs_password` | OBS WebSocket password | `""` |
 
+## Issues & Support
+
+Found a bug or have a feature request? Please open an issue on the [GitHub Issues](https://github.com/schylerchase/replay-overlay-interactive/issues) page.
+
+When reporting bugs, please include:
+- Your Windows version
+- Your OBS Studio version
+- Steps to reproduce the issue
+- Any error messages you see
+
+## AI Disclosure
+
+This project was developed with assistance from AI tools (Claude). The core architecture, feature implementation, and code refinements were created collaboratively with AI assistance. All code has been reviewed and tested by the author.
+
 ## License
 
-MIT
+MIT License - see [LICENSE](LICENSE) for details.
+
+## Disclaimer
+
+This project is not affiliated with, endorsed by, or sponsored by OBS Project or Streamlabs. OBS Studio is a trademark of the OBS Project.
