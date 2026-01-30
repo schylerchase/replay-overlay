@@ -7,24 +7,24 @@ import sys
 import os
 import json
 import base64
+import math
 import threading
 import time
 import ctypes
 import subprocess
 import logging
 import re
-import shlex
+import shutil
 from pathlib import Path
 
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
-    QLabel, QPushButton, QFrame, QSystemTrayIcon, QMenu,
-    QListWidget, QSlider, QCheckBox, QScrollArea, QLineEdit,
-    QFileDialog, QSpinBox, QDoubleSpinBox, QDialog, QTabWidget, QFormLayout,
-    QGroupBox, QComboBox, QWizard, QWizardPage
+    QLabel, QPushButton, QSystemTrayIcon, QMenu, QListWidget, QSlider,
+    QCheckBox, QScrollArea, QLineEdit, QFileDialog, QSpinBox, QDoubleSpinBox,
+    QDialog, QFormLayout, QComboBox, QWizard, QWizardPage
 )
-from PySide6.QtCore import Qt, QTimer, Signal, QObject, QSize
-from PySide6.QtGui import QPixmap, QIcon, QColor, QAction, QPainter, QFont
+from PySide6.QtCore import Qt, QTimer, Signal, QObject, QThread, QMutex, QMutexLocker
+from PySide6.QtGui import QPixmap, QIcon, QColor, QPainter, QFont
 
 try:
     import obsws_python as obsws
@@ -46,6 +46,79 @@ except ImportError:
     HAS_WATCHDOG = False
 
 VIDEO_EXTENSIONS = {'.mp4', '.mkv', '.flv', '.avi', '.mov', '.ts', '.m4v'}
+
+# =============================================================================
+# Timing & Size Constants
+# =============================================================================
+PREVIEW_INTERVAL_MS = 250           # Preview refresh rate (~4 FPS)
+STATUS_INTERVAL_MS = 1000           # UI status polling rate (1 Hz)
+BUFFER_MONITOR_INTERVAL_MS = 1000   # REC indicator polling rate
+PREVIEW_WIDTH = 320                 # OBS screenshot request width
+PREVIEW_HEIGHT = 180                # OBS screenshot request height (16:9)
+DISPLAY_PREVIEW_WIDTH = 178         # UI preview label width
+DISPLAY_PREVIEW_HEIGHT = 100        # UI preview label height
+FILE_POLL_INTERVAL_S = 0.5          # File completion check interval
+FILE_STABLE_CHECKS = 3              # Number of stable size checks before move
+FILE_COMPLETION_TIMEOUT_S = 30      # Max wait time for file to finish writing
+RECENT_FILE_CLEANUP_S = 10          # Time before removing file from recent set
+AUDIO_DEBOUNCE_S = 1.5              # Ignore poll updates after user interaction
+MAX_SCREENSHOT_SIZE = 10 * 1024 * 1024  # 10MB max for base64 screenshot data
+OBS_CONNECT_RETRIES = 10            # Number of OBS connection attempts
+OBS_CONNECT_DELAY_S = 2             # Delay between connection attempts
+SCENE_CACHE_TTL_S = 5               # How long to cache scene list
+AUDIO_LIST_CACHE_TTL_S = 10         # How long to cache audio source names
+HOTKEY_DEBOUNCE_S = 0.3             # Minimum interval between hotkey triggers
+
+# OBS Audio Fader constants
+OBS_FADER_LOG_RANGE_DB = -96.0      # Minimum dB before treating as silence
+OBS_FADER_LOG_OFFSET_DB = 6.0       # Max dB above 0 (OBS allows up to +6 dB)
+OBS_FADER_LOG_RANGE_VAL = -96.0 + 6.0  # = -90.0 total range
+
+
+def mul_to_fader(mul):
+    """Convert OBS linear volume multiplier to 0-100 fader position.
+
+    Matches OBS Studio's cubic fader curve so the slider visually aligns
+    with OBS's Audio Mixer.
+
+    OBS uses: dB = 20*log10(mul), then maps dB to a 0-1 fader via cubic root.
+    """
+    if mul <= 0.0:
+        return 0
+    db = 20.0 * math.log10(mul)
+    if db < OBS_FADER_LOG_RANGE_DB:
+        return 0
+    # Normalize dB to 0-1 range, matching OBS fader curve
+    # OBS maps -96 dB -> 0.0 and +6 dB -> 1.0 using a cubic root for perceptual linearity
+    fader = (db - OBS_FADER_LOG_RANGE_DB) / (OBS_FADER_LOG_OFFSET_DB - OBS_FADER_LOG_RANGE_DB)
+    fader = max(0.0, min(1.0, fader))
+    # Apply cubic root for perceptual scaling (matches OBS fader curve)
+    fader = fader ** (1.0 / 3.0)
+    return int(fader * 100)
+
+
+def fader_to_mul(fader_pct):
+    """Convert 0-100 fader position to OBS linear volume multiplier.
+
+    Inverse of mul_to_fader. Used when user drags the slider.
+    """
+    if fader_pct <= 0:
+        return 0.0
+    fader = fader_pct / 100.0
+    fader = max(0.0, min(1.0, fader))
+    # Reverse cubic root
+    fader = fader ** 3.0
+    # Map back to dB
+    db = fader * (OBS_FADER_LOG_OFFSET_DB - OBS_FADER_LOG_RANGE_DB) + OBS_FADER_LOG_RANGE_DB
+    return 10.0 ** (db / 20.0)
+
+
+# REC indicator position options
+REC_POSITIONS = [
+    "top-left", "top-center", "top-right",
+    "bottom-left", "bottom-center", "bottom-right"
+]
+REC_POSITION_MAP = {pos: i for i, pos in enumerate(REC_POSITIONS)}
 
 # Store config in LocalAppData with secure permissions
 APP_DATA_DIR = Path(os.environ.get('LOCALAPPDATA', Path.home())) / "ReplayOverlay"
@@ -178,6 +251,34 @@ def is_process_ignored(process_name):
     return process_name.lower() in IGNORED_PROCESSES
 
 
+def prepare_game_folder(config, replay_handler, last_game=None):
+    """Set pending game for organize-by-game feature.
+
+    Args:
+        config: Application config dict
+        replay_handler: ReplayHandler instance (may be None)
+        last_game: Fallback game name if foreground is ignored
+
+    Returns:
+        Game name if set, None otherwise
+    """
+    if not config.get('organize_by_game', False):
+        return None
+
+    game = get_foreground_process()
+
+    # If foreground is overlay or ignored, use fallback
+    if not game or is_process_ignored(game):
+        game = last_game
+
+    if game and not is_process_ignored(game):
+        if replay_handler:
+            replay_handler.pending_game = game
+        return game
+
+    return None
+
+
 def is_valid_obs_executable(obs_path):
     """Validate that obs_path points to a legitimate OBS executable.
 
@@ -290,7 +391,7 @@ def set_windows_startup(enabled):
         winreg.CloseKey(key)
         return True
     except Exception as e:
-        print(f"Startup registry error: {e}")
+        logger.error(f"Startup registry error: {e}")
         return False
 
 
@@ -407,26 +508,62 @@ def get_obs_replay_hotkey():
             return '+'.join(parts)
 
     except Exception as e:
-        print(f"Error reading OBS hotkey: {e}")
+        logger.error(f"Error reading OBS hotkey: {e}")
 
     return None
 
 
 class OBSController:
+    """Controller for OBS Studio via WebSocket protocol."""
+
+    # Audio source types to display in mixer
+    AUDIO_KINDS = {
+        'wasapi_input_capture', 'wasapi_output_capture',
+        'pulse_input_capture', 'pulse_output_capture',
+        'coreaudio_input_capture', 'coreaudio_output_capture',
+        'wasapi_process_output_capture',
+    }
+    # Capture source types for active capture detection
+    CAPTURE_TYPES = {
+        'game_capture', 'window_capture', 'monitor_capture',
+        'display_capture', 'dshow_input'
+    }
+
     def __init__(self, port=4455, password=""):
         self.port = port
         self.password = password
         self.client = None
         self._connected = False
 
+    def _safe_call(self, func, default=None):
+        """Execute OBS call with standard error handling."""
+        if not self.connected:
+            return default
+        try:
+            return func()
+        except Exception:
+            return default
+
+    def _safe_action(self, func):
+        """Execute OBS action (no return value needed)."""
+        if self.connected:
+            try:
+                func()
+            except Exception:
+                pass
+
     def connect(self):
+        """Establish connection to OBS WebSocket server."""
         if not HAS_OBSWS:
+            logger.warning("obsws-python library not available")
             return False
         try:
             self.client = obsws.ReqClient(host='localhost', port=self.port, password=self.password, timeout=3)
             self._connected = True
+            logger.info(f"Connected to OBS on port {self.port}")
             return True
-        except Exception:
+        except Exception as e:
+            logger.debug(f"OBS connection failed: {e}")
             self._connected = False
             return False
 
@@ -434,175 +571,188 @@ class OBSController:
     def connected(self):
         return self._connected and self.client is not None
 
+    # =========================================================================
+    # Scene Management
+    # =========================================================================
+
     def get_scenes(self):
-        if not self.connected: return []
-        try: return [s['sceneName'] for s in self.client.get_scene_list().scenes]
-        except Exception: return []
+        return self._safe_call(
+            lambda: [s['sceneName'] for s in self.client.get_scene_list().scenes],
+            default=[]
+        )
 
     def get_current_scene(self):
-        if not self.connected: return None
-        try: return self.client.get_current_program_scene().scene_name
-        except Exception: return None
+        return self._safe_call(
+            lambda: self.client.get_current_program_scene().scene_name
+        )
 
     def set_scene(self, name):
-        if not self.connected: return False
-        try:
-            self.client.set_current_program_scene(name)
-            return True
-        except Exception: return False
+        return self._safe_call(
+            lambda: (self.client.set_current_program_scene(name), True)[1],
+            default=False
+        )
 
     def get_scene_items(self, scene):
-        if not self.connected: return []
-        try:
-            return [{'id': i.get('sceneItemId'), 'name': i.get('sourceName'), 'visible': i.get('sceneItemEnabled', False)}
-                    for i in self.client.get_scene_item_list(scene).scene_items]
-        except Exception: return []
+        return self._safe_call(
+            lambda: [
+                {'id': i.get('sceneItemId'), 'name': i.get('sourceName'), 'visible': i.get('sceneItemEnabled', False)}
+                for i in self.client.get_scene_item_list(scene).scene_items
+            ],
+            default=[]
+        )
 
     def set_source_visible(self, scene, item_id, visible):
+        return self._safe_call(
+            lambda: (self.client.set_scene_item_enabled(scene, item_id, visible), True)[1],
+            default=False
+        )
+
+    # =========================================================================
+    # Audio Management
+    # =========================================================================
+
+    def get_audio_input_names(self):
+        """Get list of audio input names (cheap to cache, expensive to fetch)."""
         if not self.connected:
-            return False
+            return []
         try:
-            self.client.set_scene_item_enabled(scene, item_id, visible)
-            return True
+            return [
+                inp['inputName']
+                for inp in self.client.get_input_list().inputs
+                if inp.get('inputKind', '') in self.AUDIO_KINDS
+            ]
         except Exception:
-            return False
+            return []
+
+    def get_audio_levels(self, names):
+        """Get volume/mute for known audio input names.
+
+        Avoids re-fetching the full input list every cycle.
+        """
+        if not self.connected:
+            return []
+        sources = []
+        for name in names:
+            try:
+                vol = self.client.get_input_volume(name)
+                mute = self.client.get_input_mute(name)
+                sources.append({
+                    'name': name,
+                    'volume': vol.input_volume_mul if hasattr(vol, 'input_volume_mul') else 1.0,
+                    'muted': mute.input_muted if hasattr(mute, 'input_muted') else False
+                })
+            except Exception:
+                pass
+        return sources
 
     def get_audio_sources(self):
-        if not self.connected: return []
-        AUDIO_KINDS = {
-            'wasapi_input_capture', 'wasapi_output_capture',
-            'pulse_input_capture', 'pulse_output_capture',
-            'coreaudio_input_capture', 'coreaudio_output_capture',
-            'wasapi_process_output_capture',
-        }
-        try:
-            sources = []
-            for inp in self.client.get_input_list().inputs:
-                kind = inp.get('inputKind', '')
-                if kind in AUDIO_KINDS:
-                    try:
-                        vol = self.client.get_input_volume(inp['inputName'])
-                        mute = self.client.get_input_mute(inp['inputName'])
-                        sources.append({
-                            'name': inp['inputName'],
-                            'volume': vol.input_volume_mul if hasattr(vol, 'input_volume_mul') else 1.0,
-                            'muted': mute.input_muted if hasattr(mute, 'input_muted') else False
-                        })
-                    except Exception: pass
-            return sources
-        except Exception: return []
+        """Get all audio sources with levels (uncached, full fetch)."""
+        names = self.get_audio_input_names()
+        return self.get_audio_levels(names)
 
     def set_input_volume(self, name, vol):
-        if not self.connected: return False
-        try:
-            self.client.set_input_volume(name, vol_mul=vol)
-            return True
-        except Exception: return False
+        return self._safe_call(
+            lambda: (self.client.set_input_volume(name, vol_mul=vol), True)[1],
+            default=False
+        )
 
     def toggle_mute(self, name):
-        if not self.connected: return False
-        try:
-            self.client.toggle_input_mute(name)
-            return True
-        except Exception: return False
+        return self._safe_call(
+            lambda: (self.client.toggle_input_mute(name), True)[1],
+            default=False
+        )
 
-    def get_screenshot(self, w=320, h=180):
+    # =========================================================================
+    # Screenshot / Preview
+    # =========================================================================
+
+    def get_screenshot(self, w=PREVIEW_WIDTH, h=PREVIEW_HEIGHT):
         """Get screenshot with base64 size validation."""
-        if not self.connected: return None
-        MAX_BASE64_SIZE = 10 * 1024 * 1024  # 10MB max for decoded image
+        if not self.connected:
+            return None
         try:
             scene = self.get_current_scene()
-            if not scene: return None
+            if not scene:
+                return None
             resp = self.client.get_source_screenshot(name=scene, img_format="png", width=w, height=h, quality=-1)
             data = resp.image_data.split(',')[1] if ',' in resp.image_data else resp.image_data
-            # Validate base64 size before decoding
-            if len(data) > MAX_BASE64_SIZE:
+            if len(data) > MAX_SCREENSHOT_SIZE:
                 logger.warning("Screenshot base64 data exceeds size limit")
                 return None
             px = QPixmap()
             px.loadFromData(base64.b64decode(data))
             return px
-        except Exception: return None
+        except Exception:
+            return None
 
     def has_active_capture(self):
-        if not self.connected: return None
-        CAPTURE_TYPES = {'game_capture', 'window_capture', 'monitor_capture', 'display_capture', 'dshow_input'}
+        """Check if current scene has an active capture source."""
+        if not self.connected:
+            return None
         try:
             scene = self.get_current_scene()
-            if not scene: return None
+            if not scene:
+                return None
             for item in self.client.get_scene_item_list(scene).scene_items:
-                if item.get('inputKind') in CAPTURE_TYPES and item.get('sceneItemEnabled', False):
+                if item.get('inputKind') in self.CAPTURE_TYPES and item.get('sceneItemEnabled', False):
                     try:
                         if self.client.get_source_active(item.get('sourceName')).video_active:
                             return True
-                    except Exception: pass
+                    except Exception:
+                        pass
             return False
-        except Exception: return None
+        except Exception:
+            return None
+
+    # =========================================================================
+    # Output Status
+    # =========================================================================
 
     def get_stream_status(self):
-        if not self.connected: return None
-        try: return self.client.get_stream_status().output_active
-        except Exception: return None
+        return self._safe_call(lambda: self.client.get_stream_status().output_active)
 
     def get_record_status(self):
-        if not self.connected: return None
-        try: return self.client.get_record_status().output_active
-        except Exception: return None
+        return self._safe_call(lambda: self.client.get_record_status().output_active)
 
     def get_buffer_status(self):
-        if not self.connected: return None
-        try: return self.client.get_replay_buffer_status().output_active
-        except Exception: return None
+        return self._safe_call(lambda: self.client.get_replay_buffer_status().output_active)
 
     def get_virtualcam_status(self):
-        if not self.connected: return None
-        try: return self.client.get_virtual_cam_status().output_active
-        except Exception: return None
+        return self._safe_call(lambda: self.client.get_virtual_cam_status().output_active)
+
+    # =========================================================================
+    # Output Controls
+    # =========================================================================
 
     def toggle_stream(self):
-        if self.connected:
-            try: self.client.toggle_stream()
-            except Exception: pass
+        self._safe_action(lambda: self.client.toggle_stream())
 
     def toggle_record(self):
-        if self.connected:
-            try: self.client.toggle_record()
-            except Exception: pass
+        self._safe_action(lambda: self.client.toggle_record())
 
     def toggle_buffer(self):
-        if self.connected:
-            try: self.client.toggle_replay_buffer()
-            except Exception: pass
+        self._safe_action(lambda: self.client.toggle_replay_buffer())
 
     def start_buffer(self):
-        if self.connected:
-            try: self.client.start_replay_buffer()
-            except Exception: pass
+        self._safe_action(lambda: self.client.start_replay_buffer())
 
     def stop_buffer(self):
-        if self.connected:
-            try: self.client.stop_replay_buffer()
-            except Exception: pass
+        self._safe_action(lambda: self.client.stop_replay_buffer())
 
     def save_buffer(self):
-        if self.connected:
-            try:
-                self.client.save_replay_buffer()
-                return True
-            except Exception: pass
-        return False
+        return self._safe_call(
+            lambda: (self.client.save_replay_buffer(), True)[1],
+            default=False
+        )
 
     def toggle_virtualcam(self):
-        if self.connected:
-            try: self.client.toggle_virtual_cam()
-            except Exception: pass
+        self._safe_action(lambda: self.client.toggle_virtual_cam())
 
     def set_record_directory(self, path):
-        if not self.connected: return False
-        try:
-            self.client.set_record_directory(path)
-            return True
-        except Exception: return False
+        return self._safe_call(
+            lambda: (self.client.set_record_directory(path), True)[1],
+            default=False
+        )
 
 
 class SignalBridge(QObject):
@@ -612,6 +762,152 @@ class SignalBridge(QObject):
     update_preview = Signal(QPixmap)
     show_notification = Signal(str, str)
     update_rec_indicator = Signal(bool)
+
+
+class StatusWorker(QThread):
+    """Persistent worker thread for fetching OBS status.
+
+    Replaces thread-per-fetch pattern to avoid creating thousands of threads.
+    """
+    status_ready = Signal(dict)
+
+    def __init__(self, obs):
+        super().__init__()
+        self.obs = obs
+        self._running = True
+        self._paused = False
+        self._mutex = QMutex()
+        # Cache for scene list (rarely changes)
+        self._scene_cache = []
+        self._scene_cache_time = 0
+        # Cache for audio input names (rarely changes)
+        self._audio_names_cache = []
+        self._audio_names_cache_time = 0
+
+    def run(self):
+        while self._running:
+            with QMutexLocker(self._mutex):
+                paused = self._paused
+
+            if not paused and self.obs.connected:
+                data = self._fetch_all_status()
+                self.status_ready.emit(data)
+
+            self.msleep(STATUS_INTERVAL_MS)
+
+    def _fetch_all_status(self):
+        """Fetch all OBS status in one batch with caching for stable data."""
+        current_time = time.time()
+
+        # Cache scene list (changes infrequently)
+        if current_time - self._scene_cache_time > SCENE_CACHE_TTL_S:
+            self._scene_cache = self.obs.get_scenes()
+            self._scene_cache_time = current_time
+
+        # Cache audio input names (changes very rarely)
+        if current_time - self._audio_names_cache_time > AUDIO_LIST_CACHE_TTL_S:
+            self._audio_names_cache = self.obs.get_audio_input_names()
+            self._audio_names_cache_time = current_time
+
+        current_scene = self.obs.get_current_scene()
+        buffer_active = self.obs.get_buffer_status()
+
+        data = {
+            'connected': self.obs.connected,
+            'scenes': self._scene_cache,
+            'current_scene': current_scene,
+            'sources': [],
+            # Fetch levels for cached audio names (skips get_input_list call)
+            'audio': self.obs.get_audio_levels(self._audio_names_cache),
+            'streaming': self.obs.get_stream_status(),
+            'recording': self.obs.get_record_status(),
+            'buffer': buffer_active,
+            # Only check capture status when buffer is active (expensive call)
+            'has_capture': self.obs.has_active_capture() if buffer_active else None,
+        }
+
+        if current_scene:
+            data['sources'] = self.obs.get_scene_items(current_scene)
+
+        return data
+
+    def set_paused(self, paused):
+        """Pause/resume status fetching (e.g., when overlay hidden)."""
+        with QMutexLocker(self._mutex):
+            self._paused = paused
+
+    def invalidate_caches(self):
+        """Force all caches to refresh on next fetch."""
+        self._scene_cache_time = 0
+        self._audio_names_cache_time = 0
+
+    def stop(self):
+        self._running = False
+        self.wait(2000)
+
+
+class PreviewWorker(QThread):
+    """Persistent worker thread for fetching OBS preview screenshots.
+
+    Replaces thread-per-fetch pattern for preview updates.
+    """
+    preview_ready = Signal(QPixmap)
+
+    def __init__(self, obs):
+        super().__init__()
+        self.obs = obs
+        self._running = True
+        self._paused = True  # Start paused, only run when overlay visible
+        self._mutex = QMutex()
+
+    def run(self):
+        while self._running:
+            with QMutexLocker(self._mutex):
+                paused = self._paused
+
+            if not paused and self.obs.connected:
+                px = self.obs.get_screenshot(PREVIEW_WIDTH, PREVIEW_HEIGHT)
+                if px:
+                    self.preview_ready.emit(px)
+
+            self.msleep(PREVIEW_INTERVAL_MS)
+
+    def set_paused(self, paused):
+        """Pause/resume preview fetching based on overlay visibility."""
+        with QMutexLocker(self._mutex):
+            self._paused = paused
+
+    def stop(self):
+        self._running = False
+        self.wait(2000)
+
+
+class BufferMonitorWorker(QThread):
+    """Persistent worker thread for monitoring replay buffer status.
+
+    Updates REC indicator when buffer state changes.
+    """
+    buffer_changed = Signal(bool)
+
+    def __init__(self, obs):
+        super().__init__()
+        self.obs = obs
+        self._running = True
+        self._last_status = None
+
+    def run(self):
+        while self._running:
+            if self.obs.connected:
+                status = self.obs.get_buffer_status()
+                if status != self._last_status:
+                    self._last_status = status
+                    self.buffer_changed.emit(status or False)
+
+            self.msleep(BUFFER_MONITOR_INTERVAL_MS)
+
+    def stop(self):
+        self._running = False
+        self.wait(2000)
 
 
 class ReplayHandler(FileSystemEventHandler):
@@ -636,26 +932,24 @@ class ReplayHandler(FileSystemEventHandler):
         if self.pending_game and self.config.get('organize_by_game', False):
             game_folder = filepath.parent / self.pending_game
             dest = game_folder / filepath.name
-            game_name = self.pending_game  # Capture for thread
 
             def move():
                 # Wait for file to finish writing (size stops changing)
                 if not self._wait_for_file_complete(filepath):
-                    print(f"File never stabilized: {filepath}")
+                    logger.warning(f"File never stabilized: {filepath}")
                     return
                 try:
                     game_folder.mkdir(exist_ok=True)
                     if filepath.exists() and not dest.exists():
-                        import shutil
                         shutil.move(str(filepath), str(dest))
-                        print(f"Moved replay to: {dest}")
+                        logger.info(f"Moved replay to: {dest}")
                 except Exception as e:
-                    print(f"Error moving file: {e}")
+                    logger.error(f"Error moving file: {e}")
 
             threading.Thread(target=move, daemon=True).start()
             self.pending_game = None
 
-    def _wait_for_file_complete(self, filepath, timeout=30):
+    def _wait_for_file_complete(self, filepath, timeout=FILE_COMPLETION_TIMEOUT_S):
         """Wait for file to finish writing by checking if size stops changing."""
         last_size = -1
         stable_count = 0
@@ -668,19 +962,19 @@ class ReplayHandler(FileSystemEventHandler):
                 current_size = filepath.stat().st_size
                 if current_size == last_size and current_size > 0:
                     stable_count += 1
-                    if stable_count >= 3:  # Size stable for 3 checks (1.5 sec)
+                    if stable_count >= FILE_STABLE_CHECKS:
                         return True
                 else:
                     stable_count = 0
                 last_size = current_size
             except OSError:
                 pass
-            time.sleep(0.5)
+            time.sleep(FILE_POLL_INTERVAL_S)
 
         return False
 
     def _cleanup(self, name):
-        time.sleep(10)
+        time.sleep(RECENT_FILE_CLEANUP_S)
         self.recent.discard(name)
 
 
@@ -745,17 +1039,18 @@ class AudioWidget(QWidget):
         lbl.setStyleSheet("font-size: 10px; color: #ccc;")
         layout.addWidget(lbl)
 
-        # Volume slider
+        # Volume slider (uses OBS fader curve for visual alignment)
         self.slider = QSlider(Qt.Horizontal)
         self.slider.setRange(0, 100)
-        self.slider.setValue(int(volume * 100))
+        self.slider.setValue(mul_to_fader(volume))
         self.slider.setFixedHeight(14)
         self.slider.valueChanged.connect(self._on_slider_changed)
         layout.addWidget(self.slider, 1)
 
     def _on_slider_changed(self, v):
         self._last_user_change = time.time()
-        self.volume_changed.emit(self.name, v / 100.0)
+        # Convert fader position back to linear multiplier for OBS
+        self.volume_changed.emit(self.name, fader_to_mul(v))
 
     def _apply_mute_style(self, muted):
         if muted:
@@ -773,11 +1068,11 @@ class AudioWidget(QWidget):
         self.mute_btn.blockSignals(False)
 
     def update_volume(self, volume):
-        # Skip poll updates for 1.5s after user interaction to prevent feedback loop
-        if time.time() - self._last_user_change < 1.5:
+        # Skip poll updates after user interaction to prevent feedback loop
+        if time.time() - self._last_user_change < AUDIO_DEBOUNCE_S:
             return
         self.slider.blockSignals(True)
-        self.slider.setValue(int(volume * 100))
+        self.slider.setValue(mul_to_fader(volume))
         self.slider.blockSignals(False)
 
 
@@ -976,6 +1271,7 @@ class SettingsDialog(QDialog):
         self.config = config.copy()
         self.setWindowTitle("Replay Overlay")
         self.setFixedWidth(380)
+        self.setMinimumHeight(620)
         self.setStyleSheet("""
             QDialog { background-color: #1a1a2e; }
             QLabel { color: #eaeaea; font-size: 11px; }
@@ -1071,17 +1367,9 @@ class SettingsDialog(QDialog):
         rec_pos_row = QHBoxLayout()
         rec_pos_row.addWidget(QLabel("REC Position"))
         self.rec_position_combo = QComboBox()
-        self.rec_position_combo.addItems([
-            "Top-Left", "Top-Center", "Top-Right",
-            "Bottom-Left", "Bottom-Center", "Bottom-Right"
-        ])
-        # Map stored value to combo index
-        pos_map = {
-            "top-left": 0, "top-center": 1, "top-right": 2,
-            "bottom-left": 3, "bottom-center": 4, "bottom-right": 5
-        }
+        self.rec_position_combo.addItems([p.title().replace('-', '-') for p in REC_POSITIONS])
         current_pos = self.config.get('rec_indicator_position', 'top-left')
-        self.rec_position_combo.setCurrentIndex(pos_map.get(current_pos, 0))
+        self.rec_position_combo.setCurrentIndex(REC_POSITION_MAP.get(current_pos, 0))
         self.rec_position_combo.setFixedWidth(120)
         rec_pos_row.addWidget(self.rec_position_combo)
         rec_pos_row.addStretch()
@@ -1211,9 +1499,7 @@ class SettingsDialog(QDialog):
         self.config['notification_opacity'] = self.opacity_spin.value()
         self.config['notification_message'] = self.message_edit.text()
         self.config['show_rec_indicator'] = self.rec_indicator_cb.isChecked()
-        # Map combo index to position string
-        pos_values = ["top-left", "top-center", "top-right", "bottom-left", "bottom-center", "bottom-right"]
-        self.config['rec_indicator_position'] = pos_values[self.rec_position_combo.currentIndex()]
+        self.config['rec_indicator_position'] = REC_POSITIONS[self.rec_position_combo.currentIndex()]
 
         # OBS settings
         self.config['obs_path'] = self.obs_path_edit.text()
@@ -1390,6 +1676,7 @@ class OverlayPanel(QMainWindow):
         self.app = app
         self._visible = False
         self._current_scene = None
+        self._scene_hash = None  # Cache hash to avoid list comparison every poll
         self._source_widgets = {}
         self._audio_widgets = {}
         self._last_audio_names = set()
@@ -1400,11 +1687,26 @@ class OverlayPanel(QMainWindow):
         self._start_timers()
 
     def _setup_ui(self):
+        """Initialize the overlay UI - split into logical sections for readability."""
+        self._setup_window_flags()
+        panel, main = self._create_main_panel()
+        self._create_header(main)
+        self._create_preview(main)
+        self._create_scenes_sources(main)
+        self._create_audio_mixer(main)
+        self._create_controls(main)
+        self._create_footer(main)
+        self.setMinimumSize(340, 456)
+        self.resize(340, 456)
+
+    def _setup_window_flags(self):
+        """Configure window as frameless, always-on-top overlay."""
         self.setWindowFlags(Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint | Qt.Tool)
         self.setAttribute(Qt.WA_TranslucentBackground)
         self._position_window()
 
-        # Main panel with solid background
+    def _create_main_panel(self):
+        """Create the main panel with dark theme styling."""
         panel = QWidget()
         panel.setObjectName("mainPanel")
         panel.setStyleSheet("""
@@ -1445,12 +1747,13 @@ class OverlayPanel(QMainWindow):
             QSlider::sub-page:horizontal { background: #4ecca3; border-radius: 2px; }
         """)
         self.setCentralWidget(panel)
-
         main = QVBoxLayout(panel)
         main.setContentsMargins(10, 8, 10, 8)
         main.setSpacing(6)
+        return panel, main
 
-        # === HEADER ===
+    def _create_header(self, main):
+        """Create header with title, status, and control buttons."""
         header = QHBoxLayout()
         header.setSpacing(6)
         title = QLabel("OBS CONTROL")
@@ -1480,7 +1783,8 @@ class OverlayPanel(QMainWindow):
         header.addWidget(close_btn)
         main.addLayout(header)
 
-        # === PREVIEW (16:9 aspect ratio) ===
+    def _create_preview(self, main):
+        """Create the live preview area (16:9 aspect ratio)."""
         preview_container = QWidget()
         preview_container.setFixedHeight(100)
         preview_container.setStyleSheet("background: #000; border: 1px solid #2c3e50; border-radius: 4px;")
@@ -1488,18 +1792,19 @@ class OverlayPanel(QMainWindow):
         preview_layout.setContentsMargins(0, 0, 0, 0)
         preview_layout.addStretch()
         self.preview_label = QLabel("No Preview")
-        self.preview_label.setFixedSize(178, 100)  # 16:9 aspect ratio
+        self.preview_label.setFixedSize(DISPLAY_PREVIEW_WIDTH, DISPLAY_PREVIEW_HEIGHT)
         self.preview_label.setAlignment(Qt.AlignCenter)
         self.preview_label.setStyleSheet("color: #555;")
         preview_layout.addWidget(self.preview_label)
         preview_layout.addStretch()
         main.addWidget(preview_container)
 
-        # === SCENES & SOURCES (side by side) ===
+    def _create_scenes_sources(self, main):
+        """Create side-by-side scenes list and sources toggles."""
         lists = QHBoxLayout()
         lists.setSpacing(6)
 
-        # Scenes
+        # Scenes column
         scenes_col = QVBoxLayout()
         scenes_col.setSpacing(2)
         scenes_lbl = QLabel("SCENES")
@@ -1512,7 +1817,7 @@ class OverlayPanel(QMainWindow):
         scenes_col.addWidget(self.scenes_list)
         lists.addLayout(scenes_col, 1)
 
-        # Sources
+        # Sources column
         sources_col = QVBoxLayout()
         sources_col.setSpacing(2)
         sources_lbl = QLabel("SOURCES")
@@ -1533,7 +1838,8 @@ class OverlayPanel(QMainWindow):
         lists.addLayout(sources_col, 1)
         main.addLayout(lists)
 
-        # === AUDIO MIXER ===
+    def _create_audio_mixer(self, main):
+        """Create scrollable audio mixer with volume sliders."""
         audio_lbl = QLabel("AUDIO")
         audio_lbl.setObjectName("section")
         main.addWidget(audio_lbl)
@@ -1551,7 +1857,8 @@ class OverlayPanel(QMainWindow):
         self.audio_scroll.setWidget(self.audio_widget)
         main.addWidget(self.audio_scroll)
 
-        # === CONTROLS ===
+    def _create_controls(self, main):
+        """Create stream/record/buffer control buttons."""
         controls_lbl = QLabel("CONTROLS")
         controls_lbl.setObjectName("section")
         main.addWidget(controls_lbl)
@@ -1581,16 +1888,13 @@ class OverlayPanel(QMainWindow):
         row2.addWidget(self.save_btn)
         main.addLayout(row2)
 
-        # === FOOTER ===
+    def _create_footer(self, main):
+        """Create footer with hotkey hints."""
         self.footer_label = QLabel()
         self._update_footer_hints()
         self.footer_label.setAlignment(Qt.AlignCenter)
         self.footer_label.setStyleSheet("color: #555; font-size: 9px; margin-top: 4px;")
         main.addWidget(self.footer_label)
-
-        # Set minimum size, allow resizing
-        self.setMinimumSize(340, 456)
-        self.resize(340, 456)
 
     def _position_window(self):
         screen = QApplication.primaryScreen().geometry()
@@ -1602,48 +1906,24 @@ class OverlayPanel(QMainWindow):
         # Use QueuedConnection to ensure slots run in main thread when signals come from other threads
         self.signals.toggle_overlay.connect(self.toggle_visibility, Qt.QueuedConnection)
         self.signals.save_replay.connect(self._save_replay, Qt.QueuedConnection)
-        self.signals.update_ui.connect(self._update_ui, Qt.QueuedConnection)
-        self.signals.update_preview.connect(self._set_preview)
 
     def _start_timers(self):
-        self._preview_timer = QTimer()
-        self._preview_timer.timeout.connect(self._fetch_preview)
-        self._preview_timer.start(250)
+        # Use persistent worker threads instead of spawning new threads per fetch
+        self._status_worker = StatusWorker(self.obs)
+        self._status_worker.status_ready.connect(self._update_ui, Qt.QueuedConnection)
+        self._status_worker.start()
 
-        self._status_timer = QTimer()
-        self._status_timer.timeout.connect(self._fetch_status)
-        self._status_timer.start(1000)
-
-    def _fetch_preview(self):
-        if not self._visible: return
-        def fetch():
-            # Request 16:9 preview at higher res for quality, will scale down
-            px = self.obs.get_screenshot(320, 180)
-            if px: self.signals.update_preview.emit(px)
-        threading.Thread(target=fetch, daemon=True).start()
+        self._preview_worker = PreviewWorker(self.obs)
+        self._preview_worker.preview_ready.connect(self._set_preview, Qt.QueuedConnection)
+        self._preview_worker.start()
 
     def _set_preview(self, px):
         if px and not px.isNull():
-            # Scale to fit the 178x100 label (16:9 aspect ratio)
-            self.preview_label.setPixmap(px.scaled(178, 100, Qt.KeepAspectRatio, Qt.SmoothTransformation))
-
-    def _fetch_status(self):
-        def fetch():
-            data = {
-                'connected': self.obs.connected,
-                'scenes': self.obs.get_scenes(),
-                'current_scene': self.obs.get_current_scene(),
-                'sources': [],
-                'audio': self.obs.get_audio_sources(),
-                'streaming': self.obs.get_stream_status(),
-                'recording': self.obs.get_record_status(),
-                'buffer': self.obs.get_buffer_status(),
-                'has_capture': self.obs.has_active_capture(),
-            }
-            if data['current_scene']:
-                data['sources'] = self.obs.get_scene_items(data['current_scene'])
-            self.signals.update_ui.emit(data)
-        threading.Thread(target=fetch, daemon=True).start()
+            # Scale to fit the display label (16:9 aspect ratio)
+            self.preview_label.setPixmap(px.scaled(
+                DISPLAY_PREVIEW_WIDTH, DISPLAY_PREVIEW_HEIGHT,
+                Qt.KeepAspectRatio, Qt.SmoothTransformation
+            ))
 
     def _update_ui(self, data):
         # Status
@@ -1668,12 +1948,13 @@ class OverlayPanel(QMainWindow):
         else:
             self.capture_indicator.hide()
 
-        # Scenes
+        # Scenes - use hash comparison instead of list comparison
         scenes = data.get('scenes', [])
         current = data.get('current_scene')
         if scenes:
-            items = [self.scenes_list.item(i).text() for i in range(self.scenes_list.count())]
-            if scenes != items:
+            scene_hash = hash(tuple(scenes))
+            if scene_hash != self._scene_hash:
+                self._scene_hash = scene_hash
                 self.scenes_list.clear()
                 for s in scenes:
                     self.scenes_list.addItem(s)
@@ -1777,14 +2058,8 @@ class OverlayPanel(QMainWindow):
         self.audio_widget.setUpdatesEnabled(True)
 
     def _save_replay(self):
-        if self.config.get('organize_by_game', False):
-            game = get_foreground_process()
-            # If foreground is overlay or ignored, use last tracked game
-            if not game or game.lower() in IGNORED_PROCESSES:
-                game = getattr(self, '_last_game', None)
-            if game and game.lower() not in IGNORED_PROCESSES:
-                if self.app.replay_handler:
-                    self.app.replay_handler.pending_game = game
+        # Prepare game folder using shared helper (DRY)
+        prepare_game_folder(self.config, self.app.replay_handler, self._last_game)
 
         # Check capture status
         has_capture = self.obs.has_active_capture()
@@ -1797,7 +2072,6 @@ class OverlayPanel(QMainWindow):
             QTimer.singleShot(200, lambda: self.save_btn.setStyleSheet(""))
             # Show notification with custom message
             msg = self.config.get('notification_message', 'REPLAY SAVED')
-            duration = int(self.config.get('notification_duration', 3.0) * 1000)
             self.signals.show_notification.emit(msg, "#00FF00")
 
     def _update_footer_hints(self):
@@ -1809,19 +2083,9 @@ class OverlayPanel(QMainWindow):
     def _open_settings(self):
         dialog = SettingsDialog(self.config, self)
         if dialog.exec():
-            self.config.update(dialog.config)
-            save_config(self.config)
-            print(f"Settings saved. Config: toggle={self.config.get('toggle_hotkey')}, save={self.config.get('save_hotkey')}")
-            # Update footer hints with new hotkeys
+            # Delegate to App for centralized settings apply logic
+            self.app.apply_settings(dialog.config)
             self._update_footer_hints()
-            # Notify app to update hotkeys and REC indicator
-            if hasattr(self.app, '_register_hotkeys'):
-                self.app._register_hotkeys()
-            if hasattr(self.app, '_refresh_rec_indicator'):
-                self.app._refresh_rec_indicator()
-            # Also update file watcher if folder changed
-            if hasattr(self.app, '_restart_file_watcher'):
-                self.app._restart_file_watcher()
 
     def toggle_visibility(self):
         # Use actual visibility instead of internal flag for reliability
@@ -1837,13 +2101,26 @@ class OverlayPanel(QMainWindow):
             self._last_game = game
         self._visible = True
         self._position_window()
+        # Resume preview fetching when overlay is visible
+        if hasattr(self, '_preview_worker'):
+            self._preview_worker.set_paused(False)
         self.show()
         self.raise_()
         self.activateWindow()
 
     def hide_overlay(self):
         self._visible = False
+        # Pause preview fetching when overlay is hidden (saves resources)
+        if hasattr(self, '_preview_worker'):
+            self._preview_worker.set_paused(True)
         self.hide()
+
+    def cleanup_workers(self):
+        """Stop worker threads gracefully. Called on app exit."""
+        if hasattr(self, '_status_worker'):
+            self._status_worker.stop()
+        if hasattr(self, '_preview_worker'):
+            self._preview_worker.stop()
 
     def mousePressEvent(self, event):
         if event.button() == Qt.LeftButton:
@@ -1950,6 +2227,8 @@ class App:
         self.observer = None
         self._hotkey_hooks = []
         self._last_buffer_status = None
+        self._last_toggle_time = 0
+        self._last_save_time = 0
 
         self._setup_tray()
         self._connect_obs()
@@ -1968,7 +2247,7 @@ class App:
             if hotkey != self.config.get('save_hotkey', 'f9'):
                 self.config['save_hotkey'] = hotkey
                 save_config(self.config)
-                print(f"Synced save hotkey from OBS: {hotkey}")
+                logger.info(f"Synced save hotkey from OBS: {hotkey}")
 
     def _setup_tray(self):
         self.tray = QSystemTrayIcon()
@@ -2042,9 +2321,9 @@ class App:
                 logger.warning(f"Skipping OBS auto-launch: invalid path {obs_path}")
 
         def connect():
-            for _ in range(10):
+            for _ in range(OBS_CONNECT_RETRIES):
                 if self.obs.connect():
-                    print("Connected to OBS")
+                    logger.info("Connected to OBS")
                     if self.config.get('sync_obs_folder', True):
                         folder = self.config.get('watch_folder', '')
                         if folder:
@@ -2052,44 +2331,38 @@ class App:
                     # Auto-start replay buffer if configured (with retry for boot scenarios)
                     if self.config.get('auto_start_buffer', False):
                         for attempt in range(5):
-                            time.sleep(0.5 + attempt * 1.0)  # 0.5s, 1.5s, 2.5s, 3.5s, 4.5s
+                            time.sleep(0.5 + attempt * 1.0)  # Progressive backoff
                             try:
                                 if not self.obs.get_buffer_status():
                                     self.obs.start_buffer()
-                                    print("Auto-started replay buffer")
+                                    logger.info("Auto-started replay buffer")
                                 break  # Success or already running, exit retry loop
                             except Exception as e:
                                 if attempt < 4:
-                                    print(f"Buffer start attempt {attempt + 1} failed, retrying...")
+                                    logger.debug(f"Buffer start attempt {attempt + 1} failed, retrying...")
                                 else:
-                                    print(f"Could not auto-start buffer after 5 attempts: {e}")
+                                    logger.warning(f"Could not auto-start buffer after 5 attempts: {e}")
                     return
-                time.sleep(2)
-            print("Could not connect to OBS")
+                time.sleep(OBS_CONNECT_DELAY_S)
+            logger.warning("Could not connect to OBS after retries")
 
         threading.Thread(target=connect, daemon=True).start()
 
     def _is_obs_running(self):
-        """Check if OBS is already running."""
+        """Check if OBS is already running (single subprocess call)."""
         try:
             result = subprocess.run(
-                ['tasklist', '/FI', 'IMAGENAME eq obs64.exe', '/NH'],
+                ['tasklist', '/NH'],
                 capture_output=True, text=True, creationflags=subprocess.CREATE_NO_WINDOW
             )
-            if 'obs64.exe' in result.stdout.lower():
-                return True
-            # Also check obs32.exe for 32-bit systems
-            result = subprocess.run(
-                ['tasklist', '/FI', 'IMAGENAME eq obs32.exe', '/NH'],
-                capture_output=True, text=True, creationflags=subprocess.CREATE_NO_WINDOW
-            )
-            return 'obs32.exe' in result.stdout.lower()
+            output = result.stdout.lower()
+            return 'obs64.exe' in output or 'obs32.exe' in output
         except (OSError, subprocess.SubprocessError):
             return False
 
     def _register_hotkeys(self):
         if not HAS_KEYBOARD:
-            print("Keyboard library not available")
+            logger.warning("Keyboard library not available")
             return
 
         # Remove existing hotkeys by key string
@@ -2100,7 +2373,7 @@ class App:
         self._hotkey_hooks.clear()
 
         if not self.config.get('hotkey_enabled', True):
-            print("Hotkeys disabled in settings")
+            logger.info("Hotkeys disabled in settings")
             return
 
         try:
@@ -2111,30 +2384,38 @@ class App:
             if len(toggle_key) >= 2 and toggle_key not in ('+', 'ctrl', 'alt', 'shift'):
                 keyboard.add_hotkey(toggle_key, self._on_toggle_hotkey, suppress=False)
                 self._hotkey_hooks.append(toggle_key)
-                print(f"Toggle hotkey registered: {toggle_key.upper()}")
+                logger.info(f"Toggle hotkey registered: {toggle_key.upper()}")
             else:
-                print(f"Invalid toggle hotkey: '{toggle_key}', using F10")
+                logger.warning(f"Invalid toggle hotkey: '{toggle_key}', using F10")
                 keyboard.add_hotkey('f10', self._on_toggle_hotkey, suppress=False)
                 self._hotkey_hooks.append('f10')
 
             if len(save_key) >= 2 and save_key not in ('+', 'ctrl', 'alt', 'shift'):
                 keyboard.add_hotkey(save_key, self._on_save_hotkey, suppress=False)
                 self._hotkey_hooks.append(save_key)
-                print(f"Save hotkey registered: {save_key.upper()}")
+                logger.info(f"Save hotkey registered: {save_key.upper()}")
             else:
-                print(f"Invalid save hotkey: '{save_key}', using F9")
+                logger.warning(f"Invalid save hotkey: '{save_key}', using F9")
                 keyboard.add_hotkey('f9', self._on_save_hotkey, suppress=False)
                 self._hotkey_hooks.append('f9')
         except Exception as e:
-            print(f"Hotkey error: {e}")
+            logger.error(f"Hotkey error: {e}")
 
     def _on_toggle_hotkey(self):
-        """Handle toggle hotkey press - emits signal for thread safety."""
-        print("F10 pressed - toggling overlay")
+        """Handle toggle hotkey press with debounce."""
+        now = time.time()
+        if now - self._last_toggle_time < HOTKEY_DEBOUNCE_S:
+            return
+        self._last_toggle_time = now
+        logger.debug("Toggle hotkey pressed")
         self.signals.toggle_overlay.emit()
 
     def _on_save_hotkey(self):
-        """Handle save hotkey press - emits signal for thread safety."""
+        """Handle save hotkey press with debounce."""
+        now = time.time()
+        if now - self._last_save_time < HOTKEY_DEBOUNCE_S:
+            return
+        self._last_save_time = now
         self.signals.save_replay.emit()
 
     def _start_file_watcher(self):
@@ -2146,7 +2427,7 @@ class App:
         self.observer = Observer()
         self.observer.schedule(self.replay_handler, str(folder), recursive=False)
         self.observer.start()
-        print(f"Watching: {folder}")
+        logger.info(f"Watching: {folder}")
 
     def _restart_file_watcher(self):
         """Restart file watcher with updated config (e.g., new watch folder)."""
@@ -2157,18 +2438,18 @@ class App:
         self._start_file_watcher()
 
     def _start_buffer_monitor(self):
-        """Monitor buffer status and update REC indicator."""
-        def check():
-            while True:
-                time.sleep(1)
-                if not self.obs.connected:
-                    continue
-                status = self.obs.get_buffer_status()
-                if status != self._last_buffer_status:
-                    self._last_buffer_status = status
-                    self.signals.update_rec_indicator.emit(status or False)
+        """Start buffer monitor using persistent worker thread."""
+        self._buffer_worker = BufferMonitorWorker(self.obs)
+        self._buffer_worker.buffer_changed.connect(
+            lambda status: self._on_buffer_changed(status),
+            Qt.QueuedConnection
+        )
+        self._buffer_worker.start()
 
-        threading.Thread(target=check, daemon=True).start()
+    def _on_buffer_changed(self, status):
+        """Handle buffer status changes from worker thread."""
+        self._last_buffer_status = status
+        self.signals.update_rec_indicator.emit(status)
 
     def _refresh_rec_indicator(self):
         """Refresh REC indicator position and visibility after settings change."""
@@ -2182,11 +2463,8 @@ class App:
             self.rec_indicator.set_active(True)
 
     def _save_replay_from_tray(self):
-        if self.config.get('organize_by_game', False):
-            game = get_foreground_process()
-            if game and game.lower() not in IGNORED_PROCESSES:
-                if self.replay_handler:
-                    self.replay_handler.pending_game = game
+        # Prepare game folder using shared helper (DRY)
+        prepare_game_folder(self.config, self.replay_handler)
         if self.obs.save_buffer():
             msg = self.config.get('notification_message', 'REPLAY SAVED')
             self.signals.show_notification.emit(msg, "#00FF00")
@@ -2194,27 +2472,36 @@ class App:
     def _open_settings(self):
         dialog = SettingsDialog(self.config)
         if dialog.exec():
-            old_hotkeys = (self.config.get('toggle_hotkey'), self.config.get('save_hotkey'))
-            old_folder = self.config.get('watch_folder', '')
-            self.config.update(dialog.config)
-            save_config(self.config)
-            print(f"Settings saved from tray. Folder: {self.config.get('watch_folder')}")
+            self.apply_settings(dialog.config)
 
-            # Re-register hotkeys if changed
-            new_hotkeys = (self.config.get('toggle_hotkey'), self.config.get('save_hotkey'))
-            if old_hotkeys != new_hotkeys:
-                self._register_hotkeys()
+    def apply_settings(self, new_config):
+        """Apply new settings and refresh all dependent subsystems."""
+        old_hotkeys = (self.config.get('toggle_hotkey'), self.config.get('save_hotkey'))
+        old_folder = self.config.get('watch_folder', '')
 
-            # Refresh REC indicator position
-            self._refresh_rec_indicator()
+        self.config.update(new_config)
+        save_config(self.config)
+        logger.info(f"Settings saved. Folder: {self.config.get('watch_folder')}")
 
-            # Restart file watcher if folder changed
-            if old_folder != self.config.get('watch_folder', ''):
-                self._restart_file_watcher()
+        # Re-register hotkeys only if changed
+        new_hotkeys = (self.config.get('toggle_hotkey'), self.config.get('save_hotkey'))
+        if old_hotkeys != new_hotkeys:
+            self._register_hotkeys()
 
-            # Sync folder with OBS
-            if self.config.get('sync_obs_folder') and self.obs.connected:
-                self.obs.set_record_directory(self.config.get('watch_folder', ''))
+        # Refresh REC indicator position
+        self._refresh_rec_indicator()
+
+        # Restart file watcher if folder changed
+        if old_folder != self.config.get('watch_folder', ''):
+            self._restart_file_watcher()
+
+        # Sync folder with OBS
+        if self.config.get('sync_obs_folder') and self.obs.connected:
+            self.obs.set_record_directory(self.config.get('watch_folder', ''))
+
+        # Invalidate caches in case OBS config changed
+        if hasattr(self, 'overlay') and hasattr(self.overlay, '_status_worker'):
+            self.overlay._status_worker.invalidate_caches()
 
     def _open_library(self):
         folder = self.config.get('watch_folder', '')
@@ -2222,18 +2509,30 @@ class App:
             os.startfile(folder)
 
     def _restart(self):
-        self.quit()
-        python = sys.executable
-        os.execv(python, [python] + sys.argv)
+        if getattr(sys, 'frozen', False):
+            # Frozen exe: spawn new process then exit, so the old _MEI temp
+            # directory can be released before the new process cleans up
+            subprocess.Popen([sys.executable] + sys.argv[1:])
+            self.quit()
+            sys.exit(0)
+        else:
+            self.quit()
+            os.execv(sys.executable, [sys.executable] + sys.argv)
 
     def run(self):
-        print("Replay Overlay Interactive")
-        print(f"Admin: {is_admin()}")
+        logger.info("Replay Overlay Interactive")
+        logger.info(f"Admin: {is_admin()}")
         sys.exit(self.app.exec())
 
     def quit(self):
+        # Stop file watcher
         if self.observer:
             self.observer.stop()
+        # Stop worker threads gracefully
+        if hasattr(self, '_buffer_worker'):
+            self._buffer_worker.stop()
+        if hasattr(self, 'overlay'):
+            self.overlay.cleanup_workers()
         save_config(self.config)
         self.app.quit()
 
@@ -2242,7 +2541,7 @@ def main():
     # Check if admin elevation needed
     config = load_config()
     if config.get('run_as_admin', False) and not is_admin():
-        print("Requesting admin privileges...")
+        logger.info("Requesting admin privileges...")
         if request_admin_restart():
             sys.exit(0)
 

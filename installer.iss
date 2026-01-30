@@ -2,7 +2,7 @@
 ; Requires Inno Setup 6.0 or later
 
 #define MyAppName "Replay Overlay"
-#define MyAppVersion "1.1.0"
+#define MyAppVersion "1.2.0"
 #define MyAppPublisher "ReplayOverlay"
 #define MyAppURL "https://github.com/schylerchase/replay-overlay-interactive"
 #define MyAppExeName "ReplayOverlay.exe"
